@@ -1,12 +1,12 @@
 # streamlit_app.py
-# IVP / Downside-Protection Analyzer — Streamlit (Interactive Plotly + Export)
+# IVP / Downside-Protection Analyzer — Streamlit (Plotly Interactive + HTML Export)
 # - Upload CSV/XLSX
 # - yfinance prices
 # - Metrics: AnnVol, Sharpe, MaxDD, CAGR, Beta, IVP weights, Risk Contrib
 # - Trade Plan + constraints (cash target, min ticket, lot size)
 # - Market State (FRED optional), VaR/CVaR, Hedge Advice
-# - Interactive charts (Plotly) + ZIP PNG export (kaleido)
-# - Comfortable layout padding (not tight to edges) + adjustable chart height
+# - Interactive charts (Plotly) + ZIP HTML export (no Chrome/Kaleido needed)
+# - Comfortable layout padding + adjustable chart height
 
 import os, io, re, math, time, json, warnings, zipfile
 from datetime import datetime
@@ -18,7 +18,6 @@ import streamlit as st
 # ---------- Page config & styling ----------
 st.set_page_config(page_title="IVP / DRP Analyzer", layout="wide")
 
-# Global CSS: add comfortable padding and optional compact/expanded modes
 DEFAULT_PADDING_PX = 24
 st.markdown(
     f"""
@@ -221,7 +220,6 @@ def var_cvar(r, alpha=0.95, method="hist"):
     elif method == "normal":
         mu, sd = x.mean(), x.std(ddof=0)
         from math import sqrt, pi, exp
-        # 1-alpha tail (negative quantile)
         from scipy.stats import norm
         z = norm.ppf(1-alpha)
         var = -(mu + sd*z)
@@ -229,7 +227,6 @@ def var_cvar(r, alpha=0.95, method="hist"):
     elif method == "cornish":
         mu  = x.mean(); sd = x.std(ddof=0)
         if sd==0: return np.nan, np.nan
-        # asymmetry & kurtosis (robust estimation kept simple)
         s   = pd.Series(x).skew()
         k   = pd.Series(x).kurt()
         from scipy.stats import norm
@@ -474,6 +471,7 @@ def hedge_advice(state, betaP, beta_target, pv, bench_price, primary_bench, mult
 
 # ---------- Plotly Charts ----------
 import plotly.graph_objects as go
+import plotly.io as pio
 
 def _layout_base(title, h=420, rangeslider=False):
     lay = dict(
@@ -554,7 +552,18 @@ def p_corr_heatmap(r_assets, h=480):
     fig.update_layout(**_layout_base("Correlation Heatmap", h=h, rangeslider=False))
     return fig
 
-# ---------- Excel/ZIP export ----------
+# ---------- Export helpers ----------
+def figures_to_zip_html(figs: dict):
+    """Export Plotly figures as standalone HTML files and zip them."""
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, fig in figs.items():
+            if fig is None: continue
+            html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True)
+            zf.writestr(f"{name}.html", html.encode("utf-8"))
+    bio.seek(0)
+    return bio
+
 def to_excel_bytes(sheets: dict):
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as xw:
@@ -562,17 +571,6 @@ def to_excel_bytes(sheets: dict):
             if df is None: continue
             if isinstance(df, (pd.Series, pd.Index)): df = df.to_frame()
             df.to_excel(xw, sheet_name=name[:31], index=True)
-    bio.seek(0)
-    return bio
-
-def plotly_figs_to_zip(figs: dict):
-    # Needs kaleido
-    bio = io.BytesIO()
-    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, fig in figs.items():
-            if fig is None: continue
-            png_bytes = fig.to_image(format="png", scale=2)
-            zf.writestr(f"{name}.png", png_bytes)
     bio.seek(0)
     return bio
 
@@ -620,7 +618,7 @@ run_btn = st.sidebar.button("▶️ Run Analysis", use_container_width=True)
 
 # ---------- Title ----------
 st.title("Downside-Protection / IVP Portfolio Analyzer — Interactive")
-st.caption("Upload → Analyze → Visualize (Plotly) → Export")
+st.caption("Upload → Analyze → Visualize (Plotly) → Export (HTML)")
 
 # ---------- Main Flow ----------
 if run_btn:
@@ -738,15 +736,15 @@ if run_btn:
                                file_name=f"DRP_Full_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # ZIP Plotly PNGs (needs kaleido)
-            figs_zip = plotly_figs_to_zip({
+            # ZIP Plotly HTMLs (works without Chrome/Kaleido)
+            figs_zip = figures_to_zip_html({
                 "cum_port_vs_bench": p1,
                 "drawdown_port": p2,
                 "rc_file": p3,
                 "risk_return_bubble": p4,
                 "corr_heatmap": p5
             })
-            st.download_button("⬇️ Download Charts (ZIP, Plotly PNG)", data=figs_zip.getvalue(),
+            st.download_button("⬇️ Download Charts (ZIP, interactive HTML)", data=figs_zip.getvalue(),
                                file_name=f"figs_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
                                mime="application/zip")
 
