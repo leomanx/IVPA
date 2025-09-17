@@ -559,8 +559,8 @@ rangeslider  = st.sidebar.toggle("Show time-range slider (cum chart)", value=Tru
 run_btn = st.sidebar.button("▶️ Run Analysis", use_container_width=True)
 
 # -------------------- Title --------------------
-st.title("Downside-Protection / IVP Portfolio Analyzer — Interactive")
-st.caption("Upload → Analyze → Visualize (Plotly) → Export (HTML)")
+st.title("IVP Analyzer")
+st.caption("Inverse Volatility Portfolio Analyzer")
 
 # -------------------- How-to Tab --------------------
 def howto_tab():
@@ -892,4 +892,5 @@ if should_run and uploaded:
 else:
     with tab1:
         st.info("อัปโหลดไฟล์ แล้วกด ▶️ Run Analysis ทางซ้าย เพื่อเริ่มวิเคราะห์")
+
 
