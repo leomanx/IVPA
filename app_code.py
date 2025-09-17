@@ -633,8 +633,8 @@ rangeslider  = st.sidebar.toggle("Show time-range slider (cum chart)", value=Tru
 run_btn = st.sidebar.button("▶️ Run Analysis", use_container_width=True)
 
 # ---------- Title ----------
-st.title("IVP Portfolio Analyzer")
-st.caption("Upload → Analyze → Visualize → Export Reports")
+st.title("INVERSE VOLATILITY PORTFOLIO ANALYZER")
+st.caption("Welcome to IVPA : Start Upload → Setting → Analyze → Visualize → Download Reports")
 
 # ---------- Main Flow ----------
 if run_btn:
@@ -776,4 +776,5 @@ if run_btn:
 
     except Exception as e:
         st.exception(e)
+
 
