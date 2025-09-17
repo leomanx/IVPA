@@ -7,15 +7,15 @@
 # - Market State (FRED optional), VaR/CVaR, Hedge Advice
 # - Interactive charts (Plotly) + ZIP HTML export (no Chrome/Kaleido needed)
 # - Comfortable layout padding + adjustable chart height
+# - FIX: no one-liner ternary for st.plotly_chart; robust render helper
 
-import os, io, re, math, time, json, warnings, zipfile
+import os, io, re, math, time, warnings, zipfile
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-# ---------- Page config & styling ----------
 st.set_page_config(page_title="IVP / DRP Analyzer", layout="wide")
 
 DEFAULT_PADDING_PX = 24
@@ -29,9 +29,7 @@ st.markdown(
         padding-right: {DEFAULT_PADDING_PX}px;
         max-width: 1600px;
       }}
-      .stPlotlyChart {{
-        background: transparent;
-      }}
+      .stPlotlyChart {{ background: transparent; }}
     </style>
     """,
     unsafe_allow_html=True
@@ -49,7 +47,7 @@ PRICE_COL_D    = "Mkt Price(USD)"
 PRIMARY_BENCH  = "^GSPC"
 MORE_BENCHES_D = "^GSPC,GLD,BTC-USD,^NDX"
 PERIOD_D       = "5y"
-RISK_FREE_PCTD = 2.0
+RISK_FREE_PCTD = 4.0
 TARGET_VOL_D   = 0.20
 TARGET_BETA_D  = 1.00
 RC_CAP_D       = 0.15
@@ -158,7 +156,7 @@ def yf_download(tickers, start=None, end=None, period="5y"):
         if "Close" in px.columns: px=px["Close"]
         elif "Adj Close" in px.columns: px=px["Adj Close"]
         if isinstance(px, pd.Series): px = px.to_frame(tickers[0])
-    # Make charts stable across mixed markets
+    # mixed markets -> forward-fill then drop-all-null rows
     px = px.dropna(how="all").ffill()
     return px.dropna(how="all")
 
@@ -169,6 +167,7 @@ def latest_prices(tickers, period="1mo"):
 
 # ---------- Metrics / Analytics ----------
 def align_returns(px, method):
+    px = px.astype(float)
     lr = np.log(px/px.shift(1))
     return (lr.dropna(how='any') if method=='intersect' else lr.dropna(how='all'))
 
@@ -394,7 +393,7 @@ def market_state(primary_bench_price, fred_key=None):
     if len(ma200.dropna())>22 and ma200.iloc[-1]>0:
         slope200 = float((ma200.iloc[-1]-ma200.shift(20).iloc[-1])/ma200.iloc[-1])
 
-    # breadth (ETF 5 ชุด)
+    # breadth
     try:
         etfs = ["SPY","QQQ","IWM","EFA","EEM"]
         px_etf = yf_download(etfs, period="3y")
@@ -469,7 +468,7 @@ def hedge_advice(state, betaP, beta_target, pv, bench_price, primary_bench, mult
     return {"Ticker":hedge_etf,"HedgeNotional":notional,"NotionalPct":(notional/pv if pv else np.nan),
             "FuturesContracts":futs,"ETF_Shares":shares,"Advice":advice}
 
-# ---------- Plotly Charts ----------
+# ---------- Plotly ----------
 import plotly.graph_objects as go
 import plotly.io as pio
 
@@ -525,9 +524,9 @@ def p_rc_bar(metrics, col="RC_File", title=None, h=360):
 
 def p_risk_return_bubble(metrics, h=420, show_labels=True):
     if metrics is None: return None
-    cols = ["AnnVol","CAGR","File_Weight"]
-    if not set(cols).issubset(metrics.columns): return None
-    df = metrics[cols].replace([np.inf,-np.inf], np.nan).dropna()
+    cols = {"AnnVol","CAGR","File_Weight"}
+    if not cols.issubset(metrics.columns): return None
+    df = metrics[list(cols)].replace([np.inf,-np.inf], np.nan).dropna()
     if df.empty: return None
     size = (np.clip(df["File_Weight"], 0, 1) * 40) + 10
     mode = "markers+text" if show_labels else "markers"
@@ -543,7 +542,11 @@ def p_risk_return_bubble(metrics, h=420, show_labels=True):
 
 def p_corr_heatmap(r_assets, h=480):
     if r_assets is None or r_assets.empty: return None
-    corr = r_assets.corr().replace([np.inf,-np.inf], np.nan).dropna(how="all").dropna(how="all", axis=1)
+    # limit columns if too many to avoid oversized payloads
+    if r_assets.shape[1] > 80:
+        r_assets = r_assets.iloc[:, :80]
+    corr = r_assets.corr().replace([np.inf,-np.inf], np.nan)
+    corr = corr.dropna(how="all").dropna(how="all", axis=1)
     if corr.empty: return None
     fig = go.Figure(data=go.Heatmap(
         z=corr.values, x=corr.columns, y=corr.index, zmin=-1, zmax=1,
@@ -551,6 +554,19 @@ def p_corr_heatmap(r_assets, h=480):
     ))
     fig.update_layout(**_layout_base("Correlation Heatmap", h=h, rangeslider=False))
     return fig
+
+# ---------- Render helper (avoid returning DeltaGenerator) ----------
+def render_plotly(fig, fallback_msg="ยังไม่พอสำหรับพล็อต"):
+    """Safely render a Plotly figure with graceful fallback and error foldout."""
+    if fig is None:
+        st.info(fallback_msg)
+        return
+    try:
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+    except Exception as e:
+        st.warning("แสดงกราฟไม่สำเร็จ (ดูรายละเอียดด้านล่าง)")
+        with st.expander("รายละเอียด error", expanded=False):
+            st.exception(e)
 
 # ---------- Export helpers ----------
 def figures_to_zip_html(figs: dict):
@@ -650,7 +666,11 @@ if run_btn:
         metrics, r_assets, r_bench, idx_bench, cov_an, ivp_w, w_file = compute_metrics(px_assets, primary_price, w_file, rf_pct)
         idx_file = (r_assets.mul(w_file, axis=1).sum(axis=1)).add(1).cumprod()
         rP = idx_file.pct_change().dropna()
-        betaP = beta_vs(rP, r_bench.loc[rP.index]) if len(rP) else np.nan
+
+        # align benchmark returns to rP before beta calc
+        r_bench_for_beta = r_bench.reindex(rP.index).dropna()
+        rP_for_beta = rP.reindex(r_bench_for_beta.index).dropna()
+        betaP = beta_vs(rP_for_beta, r_bench_for_beta) if len(rP_for_beta) else np.nan
 
         VaR, CVaR = var_cvar(rP, alpha=var_alpha, method=var_method)
 
@@ -686,23 +706,23 @@ if run_btn:
         with tab2:
             st.subheader("Portfolio vs Benchmarks")
             p1 = p_cum_vs_bench(idx_file, bench_prices, h=chart_height, rangeslider=rangeslider)
-            st.plotly_chart(p1, use_container_width=True, config={"displaylogo": False}) if p1 else st.info("ข้อมูลยังไม่พอสำหรับพล็อต")
+            render_plotly(p1, "ข้อมูลยังไม่พอสำหรับพล็อต")
 
             st.subheader("Drawdown")
             p2 = p_drawdown(idx_file, h=max(chart_height-60, 320))
-            st.plotly_chart(p2, use_container_width=True, config={"displaylogo": False}) if p2 else st.info("ข้อมูลยังไม่พอสำหรับพล็อต")
+            render_plotly(p2, "ข้อมูลยังไม่พอสำหรับพล็อต Drawdown")
 
             st.subheader("Risk Contribution (current weights)")
             p3 = p_rc_bar(metrics, "RC_File", "Risk Contribution — File Weights", h=max(chart_height-80, 320))
-            st.plotly_chart(p3, use_container_width=True, config={"displaylogo": False}) if p3 else st.info("ไม่มีค่าที่จะพล็อต")
+            render_plotly(p3, "ไม่มีค่าที่จะพล็อต (RC_File ว่าง)")
 
             st.subheader("Risk–Return Bubble")
             p4 = p_risk_return_bubble(metrics, h=chart_height, show_labels=show_labels)
-            st.plotly_chart(p4, use_container_width=True, config={"displaylogo": False}) if p4 else st.info("ยังไม่พอสำหรับพล็อต")
+            render_plotly(p4, "ยังไม่พอสำหรับพล็อต Risk–Return (AnnVol/CAGR/Weight ว่าง)")
 
             st.subheader("Correlation Heatmap")
             p5 = p_corr_heatmap(r_assets, h=chart_height)
-            st.plotly_chart(p5, use_container_width=True, config={"displaylogo": False}) if p5 else st.info("ยังไม่พอสำหรับ Heatmap")
+            render_plotly(p5, "ยังไม่พอสำหรับ Heatmap")
 
         with tab3:
             st.subheader("Market State")
@@ -736,7 +756,6 @@ if run_btn:
                                file_name=f"DRP_Full_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # ZIP Plotly HTMLs (works without Chrome/Kaleido)
             figs_zip = figures_to_zip_html({
                 "cum_port_vs_bench": p1,
                 "drawdown_port": p2,
@@ -748,7 +767,6 @@ if run_btn:
                                file_name=f"figs_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
                                mime="application/zip")
 
-            # NAV CSV
             nav_csv = nav_df.to_csv(index=True).encode()
             st.download_button("⬇️ Download NAV CSV", data=nav_csv,
                                file_name=f"NAV_history_{datetime.now().strftime('%Y%m%d')}.csv",
@@ -758,4 +776,3 @@ if run_btn:
 
     except Exception as e:
         st.exception(e)
-
