@@ -572,7 +572,7 @@ def howto_tab():
   2) คอลัมน์ **Qty** + **Mkt Price(USD)**  
   3) คอลัมน์ **Mkt Val** (มูลค่าต่อแถว)
 - ชื่อคอลัมน์ที่ใช้จริงสามารถปรับได้ใน **Settings** ด้านซ้าย (เช่น `Symbol column`, `Weight column`, `Qty column`, `Price column`)
-- ถ้าเป็น Excel ให้ใส่แผ่น **Sheet name** ให้ตรงกับในไฟล์ (ดีฟอลต์ `Portfolio`)
+- ถ้าเป็น Excel ให้ใส่แผ่น **Sheet name** ให้ตรงกับในไฟล์ (`Portfolio`)
 - แถวรวมเช่น `TOTAL`/`SUBTOTAL` ไม่ต้องลบ โปรแกรมจะคัดทิ้งให้
 """)
     st.subheader("Template ตัวอย่าง")
@@ -892,3 +892,4 @@ if should_run and uploaded:
 else:
     with tab1:
         st.info("อัปโหลดไฟล์ แล้วกด ▶️ Run Analysis ทางซ้าย เพื่อเริ่มวิเคราะห์")
+
