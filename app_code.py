@@ -49,7 +49,7 @@ PRICE_COL_D    = "Mkt Price(USD)"
 PRIMARY_BENCH  = "^GSPC"
 MORE_BENCHES_D = "^GSPC,GLD,BTC-USD,^NDX"
 PERIOD_D       = "5y"
-RISK_FREE_PCTD = 4.0
+RISK_FREE_PCTD = 2.0
 TARGET_VOL_D   = 0.20
 TARGET_BETA_D  = 1.00
 RC_CAP_D       = 0.15
@@ -758,3 +758,4 @@ if run_btn:
 
     except Exception as e:
         st.exception(e)
+
