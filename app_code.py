@@ -1,31 +1,52 @@
 # streamlit_app.py
-# Inverse Vol / DRP Analyzer (Streamlit)
-# - Upload portfolio (CSV/XLSX)
-# - Pull prices via yfinance
-# - Compute metrics (AnnVol, Sharpe, MaxDD, CAGR, Beta, IVP weights)
-# - Trade Plan + execution constraints (lot/min-ticket/force-to-target cash)
-# - Market state (FRED optional), VaR/CVaR, CPPI, Multi-benchmark
-# - Visuals + Export Excel / ZIP figs / NAV CSV
-#
-# NOTE: Core logic adapted from your notebook/script and wrapped for Streamlit UI.
+# IVP / Downside-Protection Analyzer — Streamlit (Interactive Plotly + Export)
+# - Upload CSV/XLSX
+# - yfinance prices
+# - Metrics: AnnVol, Sharpe, MaxDD, CAGR, Beta, IVP weights, Risk Contrib
+# - Trade Plan + constraints (cash target, min ticket, lot size)
+# - Market State (FRED optional), VaR/CVaR, Hedge Advice
+# - Interactive charts (Plotly) + ZIP PNG export (kaleido)
+# - Comfortable layout padding (not tight to edges) + adjustable chart height
 
 import os, io, re, math, time, json, warnings, zipfile
 from datetime import datetime
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import streamlit as st
 import requests
+import streamlit as st
 
-# ---------- UI CONFIG ----------
-st.set_page_config(page_title="Downside-Protection / IVP Analyzer", layout="wide")
+# ---------- Page config & styling ----------
+st.set_page_config(page_title="IVP / DRP Analyzer", layout="wide")
 
-# ---------- GLOBAL DEFAULTS ----------
+# Global CSS: add comfortable padding and optional compact/expanded modes
+DEFAULT_PADDING_PX = 24
+st.markdown(
+    f"""
+    <style>
+      .block-container {{
+        padding-top: {DEFAULT_PADDING_PX}px;
+        padding-bottom: {DEFAULT_PADDING_PX}px;
+        padding-left: {DEFAULT_PADDING_PX}px;
+        padding-right: {DEFAULT_PADDING_PX}px;
+        max-width: 1600px;
+      }}
+      .stPlotlyChart {{
+        background: transparent;
+      }}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ---------- Defaults ----------
 SHEET_NAME     = "Portfolio"
 SYMBOL_COL_D   = "Symbol"
-WEIGHT_COL_D   = None                  # If None -> try Qty*Price or Equal
+WEIGHT_COL_D   = None
 QTY_COL_D      = "Qty"
 PRICE_COL_D    = "Mkt Price(USD)"
+
 PRIMARY_BENCH  = "^GSPC"
 MORE_BENCHES_D = "^GSPC,GLD,BTC-USD,^NDX"
 PERIOD_D       = "5y"
@@ -36,16 +57,14 @@ RC_CAP_D       = 0.15
 BAD_MAXDD_D    = -0.40
 BAD_SHARPE_D   = 0.0
 VAR_ALPHA_D    = 0.95
-VAR_METHOD_D   = "hist"                # 'hist'|'normal'|'cornish'
+VAR_METHOD_D   = "hist"  # 'hist'|'normal'|'cornish'
 INDEX_MULT     = 200.0
 ETF_FALLBACK   = {"^GSPC":"SPY","SPY":"SPY","^NDX":"QQQ","QQQ":"QQQ","^IXIC":"QQQ"}
 
-MIN_HIST_DAYS  = 250
 METHOD_ALIGN   = "intersect"
-RUN_TRACKER    = True
 REBASE_NAV     = 100.0
 
-# ---------- HELPERS ----------
+# ---------- Helpers ----------
 def annualize_factor(freq='D'): return 252.0 if freq=='D' else 12.0
 
 def max_drawdown(idx):
@@ -89,7 +108,7 @@ def normalize_pct(x, default):
     while v > 1.0: v /= 100.0
     return max(0.0, min(1.0, v))
 
-# ---------- DATA IO ----------
+# ---------- Data IO ----------
 @st.cache_data(show_spinner=False)
 def read_portfolio(uploaded_file, sym_col, w_col, qty_col, px_col, sheet_name=SHEET_NAME):
     if uploaded_file is None:
@@ -140,6 +159,8 @@ def yf_download(tickers, start=None, end=None, period="5y"):
         if "Close" in px.columns: px=px["Close"]
         elif "Adj Close" in px.columns: px=px["Adj Close"]
         if isinstance(px, pd.Series): px = px.to_frame(tickers[0])
+    # Make charts stable across mixed markets
+    px = px.dropna(how="all").ffill()
     return px.dropna(how="all")
 
 @st.cache_data(show_spinner=False)
@@ -147,7 +168,7 @@ def latest_prices(tickers, period="1mo"):
     px = yf_download(tickers, period=period)
     return pd.Series({t: float(px[t].dropna().iloc[-1]) for t in tickers if t in px.columns})
 
-# ---------- METRICS / ANALYTICS ----------
+# ---------- Metrics / Analytics ----------
 def align_returns(px, method):
     lr = np.log(px/px.shift(1))
     return (lr.dropna(how='any') if method=='intersect' else lr.dropna(how='all'))
@@ -166,7 +187,6 @@ def compute_metrics(px_assets, bench_price, file_weights, rf_pct):
     w_file = file_weights.reindex(r_assets.columns).fillna(0.0)
     w_file = w_file/(w_file.sum() if w_file.sum()!=0 else 1.0); w_file.name="File_Weight"
 
-    # risk contribution
     def portfolio_vol(weights, cov_an):
         if cov_an.empty or weights.empty: return np.nan
         w = weights.values.reshape(-1,1)
@@ -200,32 +220,27 @@ def var_cvar(r, alpha=0.95, method="hist"):
         cvar = -x[x <= q].mean() if (x <= q).any() else np.nan
     elif method == "normal":
         mu, sd = x.mean(), x.std(ddof=0)
-        from math import erf, sqrt
-        # z for alpha tail:
-        import mpmath as mp
-        z = float(mp.erfcinv(2*(1-alpha))*math.sqrt(2))  # approx
+        from math import sqrt, pi, exp
+        # 1-alpha tail (negative quantile)
+        from scipy.stats import norm
+        z = norm.ppf(1-alpha)
         var = -(mu + sd*z)
-        cvar = -(mu - sd * (math.exp(-0.5*z*z)/math.sqrt(2*math.pi))/(1-alpha))
+        cvar = -(mu - sd * (exp(-0.5*z*z)/np.sqrt(2*pi))/(1-alpha))
     elif method == "cornish":
         mu  = x.mean(); sd = x.std(ddof=0)
         if sd==0: return np.nan, np.nan
-        s   = ((x - mu)/sd).mean()**3
-        k   = ((x - mu)/sd).mean()**4 - 3
-        # Use standard normal ppf from numpy
+        # asymmetry & kurtosis (robust estimation kept simple)
+        s   = pd.Series(x).skew()
+        k   = pd.Series(x).kurt()
         from scipy.stats import norm
         z   = norm.ppf(alpha)
         zcf = (z + (s/6)*(z**2-1) + (k/24)*(z**3-3*z) - (s**2/36)*(2*z**3-5*z))
+        from math import sqrt, pi, exp
         var = -(mu + sd*zcf)
-        cvar = -(mu - sd * (math.exp(-0.5*zcf*zcf)/math.sqrt(2*math.pi))/(1-alpha))
+        cvar = -(mu - sd * (exp(-0.5*zcf*zcf)/np.sqrt(2*pi))/(1-alpha))
     else:
         raise ValueError("method must be 'hist'|'normal'|'cornish'")
     return float(var), float(cvar)
-
-def vol_scaler(rP, target_ann_vol=0.20, lookback=20, clip=(0.5, 1.5)):
-    rP = pd.Series(rP)
-    sig = rP.rolling(lookback).std(ddof=0) * np.sqrt(252)
-    scale = (target_ann_vol / sig).clip(lower=clip[0], upper=clip[1])
-    return scale.fillna(1.0)
 
 def build_trade_plan(metrics, rc_cap=0.15, forbid_bad_buy=True, bad_mdd=-0.40, bad_sharpe=0.0):
     df = metrics.copy()
@@ -253,9 +268,9 @@ def build_trade_plan(metrics, rc_cap=0.15, forbid_bad_buy=True, bad_mdd=-0.40, b
     reason=[]
     for t in df.index:
         rs=[]
-        if t in over.index and over.loc[t]: rs.append(f"RC>{int(rc_cap*100)}%")
-        if t in bad.index and bad.loc[t]:  rs.append("Sharpe<0/DeepDD")
-        if t in good.index and good.loc[t]: rs.append("Diversifier")
+        if t in over.index and bool(over.loc[t]): rs.append(f"RC>{int(rc_cap*100)}%")
+        if t in bad.index and bool(bad.loc[t]):  rs.append("Sharpe<0/DeepDD")
+        if t in good.index and bool(good.loc[t]): rs.append("Diversifier")
         if not rs: rs.append("Rebalance→IVP")
         reason.append(", ".join(rs))
 
@@ -326,7 +341,7 @@ def apply_trade_constraints(tp, last_px, pv, cash_now_pct, cash_tgt_pct, min_tic
     }
     return tp, summary
 
-# ---------- MARKET STATE (FRED) ----------
+# ---------- Market State (FRED) ----------
 def _detect_fred_key(key, env_default="FRED_API_KEY"):
     key = (key or os.environ.get(env_default, "")).strip().strip('"').strip("'")
     return key
@@ -457,48 +472,89 @@ def hedge_advice(state, betaP, beta_target, pv, bench_price, primary_bench, mult
     return {"Ticker":hedge_etf,"HedgeNotional":notional,"NotionalPct":(notional/pv if pv else np.nan),
             "FuturesContracts":futs,"ETF_Shares":shares,"Advice":advice}
 
-# ---------- VISUALS ----------
-def plot_cum_vs_bench(idx_port, bench_prices):
-    fig=plt.figure()
-    idx_port=pd.Series(idx_port).dropna()
-    (idx_port/idx_port.iloc[0]).rename("Portfolio").plot()
+# ---------- Plotly Charts ----------
+import plotly.graph_objects as go
+
+def _layout_base(title, h=420, rangeslider=False):
+    lay = dict(
+        title=title,
+        margin=dict(l=40, r=28, t=50, b=40),
+        xaxis=dict(rangeslider=dict(visible=rangeslider)),
+        yaxis=dict(automargin=True),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    )
+    if h: lay["height"] = int(h)
+    return lay
+
+def p_cum_vs_bench(idx_port, bench_prices, h=420, rangeslider=True):
+    s = pd.Series(idx_port).dropna()
+    if s.size < 2: return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=s.index, y=(s/s.iloc[0]).values,
+                             mode="lines", name="Portfolio",
+                             hovertemplate="%{x|%Y-%m-%d}<br>Idx=%{y:.3f}<extra></extra>"))
     for name, px in bench_prices.items():
-        s=pd.Series(px).dropna()
-        if s.empty: continue
-        (s/s.iloc[0]).rename(name).plot()
-    plt.title("Cumulative Index: Portfolio vs Benchmarks")
-    plt.xlabel("Date"); plt.ylabel("Index (rebased=1.0)")
-    plt.grid(True, alpha=0.3); plt.legend(ncols=2, fontsize=9)
+        p = pd.Series(px).dropna()
+        if p.size >= 2:
+            fig.add_trace(go.Scatter(x=p.index, y=(p/p.iloc[0]).values,
+                                     mode="lines", name=name,
+                                     hovertemplate="%{x|%Y-%m-%d}<br>Idx=%{y:.3f}<extra></extra>"))
+    fig.update_layout(**_layout_base("Cumulative Index: Portfolio vs Benchmarks", h=h, rangeslider=rangeslider))
+    fig.update_yaxes(title="Index (rebased=1.0)")
     return fig
 
-def plot_drawdown(idx_port):
-    fig=plt.figure()
-    s=pd.Series(idx_port).dropna()
-    (s/s.cummax()-1).rename("Drawdown").plot()
-    plt.title("Portfolio Drawdown"); plt.xlabel("Date"); plt.ylabel("Drawdown")
-    plt.grid(True, alpha=0.3)
+def p_drawdown(idx_port, h=380):
+    s = pd.Series(idx_port).dropna()
+    if s.size < 2: return None
+    dd = s/s.cummax() - 1.0
+    fig = go.Figure(go.Scatter(x=dd.index, y=dd.values, mode="lines", name="Drawdown",
+                               hovertemplate="%{x|%Y-%m-%d}<br>DD=%{y:.2%}<extra></extra>"))
+    fig.update_layout(**_layout_base("Portfolio Drawdown", h=h, rangeslider=False))
+    fig.update_yaxes(title="Drawdown")
     return fig
 
-def plot_rc_bar(metrics, col="RC_File", title=None):
-    if col not in metrics.columns: return None
-    fig=plt.figure()
-    metrics[col].sort_values(ascending=False).plot(kind="bar")
-    plt.title(title or f"Risk Contribution — {col}")
-    plt.xlabel("Symbol"); plt.ylabel("Contribution")
-    plt.grid(True, axis="y", alpha=0.3); plt.tight_layout()
+def p_rc_bar(metrics, col="RC_File", title=None, h=360):
+    if metrics is None or col not in metrics.columns: return None
+    ser = metrics[col].copy().astype(float).replace([np.inf,-np.inf], np.nan).dropna()
+    if ser.empty: return None
+    ser = ser.sort_values(ascending=False)
+    fig = go.Figure(go.Bar(x=ser.index, y=ser.values,
+                           hovertemplate="%{x}<br>RC=%{y:.4f}<extra></extra>"))
+    fig.update_layout(**_layout_base(title or f"Risk Contribution — {col}", h=h, rangeslider=False))
+    fig.update_yaxes(title="Contribution")
     return fig
 
-def plot_risk_return_bubble(metrics):
-    df=metrics[["AnnVol","CAGR","File_Weight"]].dropna()
+def p_risk_return_bubble(metrics, h=420, show_labels=True):
+    if metrics is None: return None
+    cols = ["AnnVol","CAGR","File_Weight"]
+    if not set(cols).issubset(metrics.columns): return None
+    df = metrics[cols].replace([np.inf,-np.inf], np.nan).dropna()
     if df.empty: return None
-    fig=plt.figure()
-    x=df["AnnVol"].values; y=df["CAGR"].values; sz=(df["File_Weight"].values*1500)+10
-    plt.scatter(x,y,s=sz,alpha=0.6)
-    for sym,xv,yv in zip(df.index,x,y): plt.annotate(sym,(xv,yv))
-    plt.title("Risk–Return Map (bubble = current weight)"); plt.xlabel("AnnVol"); plt.ylabel("CAGR")
-    plt.grid(True, alpha=0.3)
+    size = (np.clip(df["File_Weight"], 0, 1) * 40) + 10
+    mode = "markers+text" if show_labels else "markers"
+    fig = go.Figure(go.Scatter(
+        x=df["AnnVol"], y=df["CAGR"], mode=mode,
+        text=df.index if show_labels else None, textposition="top center",
+        marker=dict(size=size),
+        hovertemplate="Sym=%{text}<br>AnnVol=%{x:.3f}<br>CAGR=%{y:.3f}<extra></extra>"
+    ))
+    fig.update_layout(**_layout_base("Risk–Return Map (bubble = current weight)", h=h, rangeslider=False))
+    fig.update_xaxes(title="AnnVol"); fig.update_yaxes(title="CAGR")
     return fig
 
+def p_corr_heatmap(r_assets, h=480):
+    if r_assets is None or r_assets.empty: return None
+    corr = r_assets.corr().replace([np.inf,-np.inf], np.nan).dropna(how="all").dropna(how="all", axis=1)
+    if corr.empty: return None
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values, x=corr.columns, y=corr.index, zmin=-1, zmax=1,
+        hovertemplate="(%{y}, %{x})=%{z:.2f}<extra></extra>"
+    ))
+    fig.update_layout(**_layout_base("Correlation Heatmap", h=h, rangeslider=False))
+    return fig
+
+# ---------- Excel/ZIP export ----------
 def to_excel_bytes(sheets: dict):
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as xw:
@@ -509,19 +565,18 @@ def to_excel_bytes(sheets: dict):
     bio.seek(0)
     return bio
 
-def figs_to_zip(figs: dict):
+def plotly_figs_to_zip(figs: dict):
+    # Needs kaleido
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, fig in figs.items():
             if fig is None: continue
-            png = io.BytesIO()
-            fig.savefig(png, dpi=160, bbox_inches="tight")
-            png.seek(0)
-            zf.writestr(f"{name}.png", png.read())
+            png_bytes = fig.to_image(format="png", scale=2)
+            zf.writestr(f"{name}.png", png_bytes)
     bio.seek(0)
     return bio
 
-# ---------- UI: SIDEBAR ----------
+# ---------- Sidebar ----------
 st.sidebar.title("⚙️ Settings")
 uploaded = st.sidebar.file_uploader("Upload Portfolio (CSV/XLSX)", type=["csv","xlsx"])
 sheet_name = st.sidebar.text_input("Sheet name (XLSX)", SHEET_NAME)
@@ -556,19 +611,25 @@ var_method= st.sidebar.selectbox("VaR method", ["hist","normal","cornish"], inde
 st.sidebar.markdown("---")
 fred_key  = st.sidebar.text_input("FRED API Key (optional)", value=os.environ.get("FRED_API_KEY",""))
 
+st.sidebar.markdown("---")
+chart_height = st.sidebar.slider("Chart height (px)", min_value=320, max_value=900, value=460, step=20)
+show_labels  = st.sidebar.toggle("Show labels on bubble chart", value=True)
+rangeslider  = st.sidebar.toggle("Show time-range slider (cum chart)", value=True)
+
 run_btn = st.sidebar.button("▶️ Run Analysis", use_container_width=True)
 
-st.title("Downside-Protection / IVP Portfolio Analyzer (Streamlit)")
-st.caption("Upload → Analyze → Visualize → Export")
+# ---------- Title ----------
+st.title("Downside-Protection / IVP Portfolio Analyzer — Interactive")
+st.caption("Upload → Analyze → Visualize (Plotly) → Export")
 
-# ---------- MAIN FLOW ----------
+# ---------- Main Flow ----------
 if run_btn:
     try:
         with st.spinner("Loading portfolio..."):
             tickers, w_file = read_portfolio(uploaded, sym_col, (weight_col or None), qty_col, price_col, sheet_name)
 
         st.success(f"Loaded {len(tickers)} symbols")
-        st.write(pd.DataFrame({"Weight":w_file}).rename_axis("Symbol"))
+        st.dataframe(pd.DataFrame({"Weight":w_file}).rename_axis("Symbol"), use_container_width=True)
 
         benches = [s.strip() for s in more_benches.split(",") if s.strip()]
         all_syms = list(dict.fromkeys(tickers + ([primary_bench] if primary_bench not in benches else []) + benches))
@@ -578,7 +639,6 @@ if run_btn:
         if primary_bench not in px_all.columns:
             st.error(f"ไม่พบ {primary_bench} ในข้อมูลราคา"); st.stop()
 
-        # filter missing
         miss = [t for t in tickers if t not in px_all.columns]
         if miss:
             st.warning(f"ตัดออก (ไม่มีราคา): {', '.join(miss)}")
@@ -589,14 +649,12 @@ if run_btn:
         px_assets = px_all[tickers]
         primary_price = px_all[primary_bench].rename(primary_bench)
 
-        # metrics
         metrics, r_assets, r_bench, idx_bench, cov_an, ivp_w, w_file = compute_metrics(px_assets, primary_price, w_file, rf_pct)
         idx_file = (r_assets.mul(w_file, axis=1).sum(axis=1)).add(1).cumprod()
         rP = idx_file.pct_change().dropna()
         betaP = beta_vs(rP, r_bench.loc[rP.index]) if len(rP) else np.nan
 
         VaR, CVaR = var_cvar(rP, alpha=var_alpha, method=var_method)
-        scaler = vol_scaler(rP, target_ann_vol=target_vol, lookback=20, clip=(0.5,1.5))
 
         tp = build_trade_plan(metrics, rc_cap=rc_cap, forbid_bad_buy=True, bad_mdd=bad_mdd, bad_sharpe=bad_shp)
         last_px = latest_prices(tp.index.tolist())
@@ -608,20 +666,15 @@ if run_btn:
             lot_func=None
         )
 
-        # market state + hedge
         state, state_detail, fred_sum = market_state(primary_price, fred_key if fred_key else None)
         hedge = hedge_advice(state, betaP, target_beta, pv, primary_price, primary_bench, INDEX_MULT)
 
-        # multi-benchmark
         bench_prices = {b:px_all[b] for b in benches if b in px_all.columns}
-
-        # NAV tracker (in-memory)
         nav_series = (pd.Series(idx_file)/pd.Series(idx_file).dropna().iloc[0])*REBASE_NAV
-        nav_df = nav_series.rename("NAV").to_frame()
-        nav_df.index.name = "Date"
+        nav_df = nav_series.rename("NAV").to_frame(); nav_df.index.name = "Date"
 
-        # ---------- LAYOUT ----------
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Metrics & Plan","📈 Charts","🧭 Market & Risk","📦 Export"])
+        # ---------- Layout Tabs ----------
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Metrics & Plan","📈 Charts (Interactive)","🧭 Market & Risk","📦 Export"])
 
         with tab1:
             st.subheader("Asset Metrics")
@@ -634,20 +687,24 @@ if run_btn:
 
         with tab2:
             st.subheader("Portfolio vs Benchmarks")
-            fig1 = plot_cum_vs_bench(idx_file, bench_prices)
-            st.pyplot(fig1, use_container_width=True)
+            p1 = p_cum_vs_bench(idx_file, bench_prices, h=chart_height, rangeslider=rangeslider)
+            st.plotly_chart(p1, use_container_width=True, config={"displaylogo": False}) if p1 else st.info("ข้อมูลยังไม่พอสำหรับพล็อต")
 
             st.subheader("Drawdown")
-            fig2 = plot_drawdown(idx_file)
-            st.pyplot(fig2, use_container_width=True)
+            p2 = p_drawdown(idx_file, h=max(chart_height-60, 320))
+            st.plotly_chart(p2, use_container_width=True, config={"displaylogo": False}) if p2 else st.info("ข้อมูลยังไม่พอสำหรับพล็อต")
 
             st.subheader("Risk Contribution (current weights)")
-            fig3 = plot_rc_bar(metrics, "RC_File", "Risk Contribution — File Weights")
-            if fig3: st.pyplot(fig3, use_container_width=True)
+            p3 = p_rc_bar(metrics, "RC_File", "Risk Contribution — File Weights", h=max(chart_height-80, 320))
+            st.plotly_chart(p3, use_container_width=True, config={"displaylogo": False}) if p3 else st.info("ไม่มีค่าที่จะพล็อต")
 
             st.subheader("Risk–Return Bubble")
-            fig4 = plot_risk_return_bubble(metrics)
-            if fig4: st.pyplot(fig4, use_container_width=True)
+            p4 = p_risk_return_bubble(metrics, h=chart_height, show_labels=show_labels)
+            st.plotly_chart(p4, use_container_width=True, config={"displaylogo": False}) if p4 else st.info("ยังไม่พอสำหรับพล็อต")
+
+            st.subheader("Correlation Heatmap")
+            p5 = p_corr_heatmap(r_assets, h=chart_height)
+            st.plotly_chart(p5, use_container_width=True, config={"displaylogo": False}) if p5 else st.info("ยังไม่พอสำหรับ Heatmap")
 
         with tab3:
             st.subheader("Market State")
@@ -663,7 +720,6 @@ if run_btn:
 
         with tab4:
             st.subheader("Download files")
-            # Excel
             sheets = {
                 "Inputs": pd.DataFrame({"Param":["PrimaryBench","RF(%)","TargetVol","TargetBeta","RC_cap","Period","VaR_method","VaR_alpha"],
                                         "Value":[primary_bench,rf_pct,target_vol,target_beta,rc_cap,period,var_method,var_alpha]}).set_index("Param"),
@@ -675,7 +731,6 @@ if run_btn:
                 "Hedge": pd.DataFrame([hedge]).T.rename(columns={0:"Value"}),
                 "Cumulative_Index": pd.Series(idx_file, name="Port_File").to_frame(),
                 "VaR_CVaR": pd.DataFrame([{"alpha":var_alpha,"method":var_method,"VaR":VaR,"CVaR":CVaR}]).T.rename(columns={0:"Value"}),
-                "Vol_Scaler": vol_scaler(rP).rename("Vol_Scale").to_frame(),
                 "NAV_Tracker": nav_df.reset_index()
             }
             excel_bytes = to_excel_bytes(sheets)
@@ -683,14 +738,15 @@ if run_btn:
                                file_name=f"DRP_Full_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # ZIP figs
-            figs_zip = figs_to_zip({
-                "cum_port_vs_bench": fig1,
-                "drawdown_port": fig2,
-                "rc_file": fig3,
-                "risk_return_bubble": fig4
+            # ZIP Plotly PNGs (needs kaleido)
+            figs_zip = plotly_figs_to_zip({
+                "cum_port_vs_bench": p1,
+                "drawdown_port": p2,
+                "rc_file": p3,
+                "risk_return_bubble": p4,
+                "corr_heatmap": p5
             })
-            st.download_button("⬇️ Download Charts (ZIP)", data=figs_zip.getvalue(),
+            st.download_button("⬇️ Download Charts (ZIP, Plotly PNG)", data=figs_zip.getvalue(),
                                file_name=f"figs_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
                                mime="application/zip")
 
