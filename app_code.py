@@ -102,6 +102,87 @@ def normalize_pct(x, default):
     while v > 1.0: v /= 100.0
     return max(0.0, min(1.0, v))
 
+# ---------- Gauges ----------
+def _zones_to_steps(zones):
+    # zones = [(max_val, color), ...] over [min,max]; returns plotly steps
+    steps = []
+    last = None
+    for z, color in zones:
+        steps.append(dict(range=[last, z] if last is not None else None, color=color))
+        last = z
+    return steps
+
+def make_gauge(title, value, vmin, vmax, zones, fmt="auto", suffix="", h=260):
+    """
+    Interactive gauge with color zones.
+    zones: list of tuples [(cut1, color), (cut2, color), ..., (vmax, color)]
+           e.g. for good-high metric: [(0.45,'#ff4b4b'), (0.55,'#f7c948'), (1.0,'#10b981')]
+           for good-low metric:  [(0.3,'#10b981'), (0.6,'#f7c948'), (1.0,'#ff4b4b')]
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    # format number
+    if fmt == "pct":
+        disp = f"{value:.0%}"
+    elif fmt == "pct1":
+        disp = f"{value:.1%}"
+    elif fmt == "bp":  # percentage points, e.g. 0.54 -> 0.54%
+        disp = f"{value:.2f}%"
+    else:
+        disp = f"{value:.3f}"
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=float(value),
+        number={"valueformat": "", "suffix": (" "+suffix).rstrip(), "font":{"size":18}},
+        title={"text": title, "font":{"size":14}},
+        gauge={
+            "axis":{"range":[vmin, vmax]},
+            "bar":{"color":"#2563eb"},  # pointer
+            "steps":[
+                {"range":[vmin, zones[0][0]], "color": zones[0][1]},
+                *[
+                    {"range":[zones[i-1][0], zones[i][0]], "color": zones[i][1]}
+                    for i in range(1, len(zones))
+                ]
+            ],
+        },
+        domain={"x":[0,1], "y":[0,1]}
+    ))
+    fig.update_layout(margin=dict(l=18,r=18,t=38,b=10), height=h)
+    return fig
+
+def judge_text(name, v):
+    # คืนคำอธิบายสั้นๆ ไทย/ระดับไฟจราจร
+    def lvl(low, mid, high, good_is_high=True):
+        if np.isnan(v): return "ไม่มีข้อมูล"
+        if good_is_high:
+            if v < low: return "อ่อน/เสี่ยง"
+            if v < mid: return "กลาง"
+            return "แข็ง/เอื้อ"
+        else:
+            if v < low: return "ดี/เสี่ยงต่ำ"
+            if v < mid: return "กลาง"
+            return "สูง/ระวัง"
+
+    if name == "trend_score":
+        return lvl(0.55, 0.70, 1.0, True) + " (แนวโน้ม)"
+    if name == "risk_score":
+        return lvl(0.30, 0.60, 1.0, False) + " (ความเสี่ยงรวม)"
+    if name == "breadth_5ETF_%>200D":
+        return "แข็ง" if v>=0.7 else ("กลาง" if v>=0.4 else "อ่อน")
+    if name == "vix_pctile_3y":
+        return "สงบ" if v<0.2 else ("ปกติ" if v<=0.8 else "ตึงเครียด")
+    if name == "hy_spread_risk":
+        return lvl(0.30, 0.60, 1.0, False) + " (เครดิต)"
+    if name == "curve_10y2y":
+        return "ปกติ" if v>0 else "โค้งกลับหัว (เสี่ยง)"
+    if name == "pmi_score":
+        return "ขยายตัว" if v>0.55 else ("ทรงตัว" if v>=0.45 else "หดตัว")
+    if name == "infl_risk_corePCE":
+        return lvl(0.40, 0.70, 1.0, False) + " (เงินเฟ้อ)"
+    return ""
+
 # -------------------- Data IO --------------------
 @st.cache_data(show_spinner=False)
 def read_portfolio(uploaded_file, sym_col, w_col, qty_col, px_col, sheet_name=SHEET_NAME):
@@ -826,6 +907,51 @@ if should_run and uploaded:
             st.subheader("Market State")
             st.json({"State":state, **state_detail})
 
+        # --- Interactive Gauges ---
+        st.markdown("### Gauges")
+        
+        # เตรียมค่า
+        ts  = state_detail.get("trend_score", np.nan)
+        rs  = state_detail.get("risk_score",  np.nan)
+        br  = state_detail.get("breadth_5ETF_%>200D", np.nan)
+        vix = state_detail.get("vix_pctile_3y", np.nan)
+        hy  = state_detail.get("hy_spread_risk", np.nan)
+        yc  = state_detail.get("curve_10y2y", np.nan)     # percentage points (e.g. 0.54)
+        pmi = state_detail.get("pmi_score", np.nan)
+        inf = state_detail.get("infl_risk_corePCE", np.nan)
+        
+        # วางเป็นกริด 3 คอลัมน์
+        rows = [
+            [
+                ("Trend",   make_gauge("Trend score", ts, 0, 1, [(0.55,"#ff4b4b"), (0.70,"#f7c948"), (1.0,"#10b981")], fmt="pct1"), ("trend_score", ts)),
+                ("Risk",    make_gauge("Risk score", rs, 0, 1, [(0.30,"#10b981"), (0.60,"#f7c948"), (1.0,"#ff4b4b")], fmt="pct1"), ("risk_score", rs)),
+                ("Breadth", make_gauge("%>200D (5 ETFs)", br, 0, 1, [(0.40,"#ff4b4b"), (0.70,"#f7c948"), (1.0,"#10b981")], fmt="pct1"), ("breadth_5ETF_%>200D", br)),
+            ],
+            [
+                ("VIX pctile", make_gauge("VIX percentile (3y)", vix, 0, 1, [(0.20,"#10b981"), (0.80,"#f7c948"), (1.0,"#ff4b4b")], fmt="pct1"), ("vix_pctile_3y", vix)),
+                ("HY risk",    make_gauge("HY spread risk", hy, 0, 1, [(0.30,"#10b981"), (0.60,"#f7c948"), (1.0,"#ff4b4b")], fmt="pct1"), ("hy_spread_risk", hy)),
+                ("Yield curve",make_gauge("10y-2y", yc, -1.0, 2.0, [(0.0,"#ff4b4b"), (0.5,"#f7c948"), (2.0,"#10b981")], fmt="bp", suffix=""), ("curve_10y2y", yc)),
+            ],
+            [
+                ("PMI",  make_gauge("PMI score", pmi, 0, 1, [(0.45,"#ff4b4b"), (0.55,"#f7c948"), (1.0,"#10b981")], fmt="pct1"), ("pmi_score", pmi)),
+                ("Infl.",make_gauge("Inflation risk (Core PCE)", inf, 0, 1, [(0.40,"#10b981"), (0.70,"#f7c948"), (1.0,"#ff4b4b")], fmt="pct1"), ("infl_risk_corePCE", inf)),
+                (None, None, (None, None)),
+            ]
+        ]
+        
+        for row in rows:
+            cols = st.columns(3, vertical_alignment="top")
+            for col, item in zip(cols, row):
+                label, fig, keypair = item
+                name, val = keypair
+                if fig is None:
+                    col.empty()
+                else:
+                    with col:
+                        render_plotly(fig, "ไม่มีข้อมูล")
+                        if name:
+                            st.caption("**"+judge_text(name, val)+"**")
+          
             # Indicator explanations
             st.subheader("How to read the indicators")
             st.markdown("""
@@ -892,5 +1018,6 @@ if should_run and uploaded:
 else:
     with tab1:
         st.info("อัปโหลดไฟล์ แล้วกด ▶️ Run Analysis ทางซ้าย เพื่อเริ่มวิเคราะห์")
+
 
 
