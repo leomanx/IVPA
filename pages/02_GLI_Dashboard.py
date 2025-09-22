@@ -1,5 +1,5 @@
 # pages/02_GLI_Dashboard.py
-import os, math
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,10 +7,11 @@ import plotly.graph_objects as go
 
 import gli_lib as gl
 
-# ---------- Page setup ----------
+# =========================
+# Page & Helpers
+# =========================
 st.set_page_config(page_title="GLI Dashboard", layout="wide")
 
-# ---------- Helpers (safe display & robust lookup) ----------
 def _fmt_pct(x):
     return "—" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
 
@@ -31,7 +32,7 @@ def _to_display_df(x: pd.DataFrame | pd.Series) -> pd.DataFrame:
     else:
         df = x.copy()
     df = _flatten_cols(df)
-    # ทำให้ index เป็นคอลัมน์ string เสมอ เพื่อกัน pyarrow error
+    # make index a string column (avoid pyarrow issues)
     if not isinstance(df.index, pd.RangeIndex):
         try:
             if isinstance(df.index, pd.MultiIndex):
@@ -41,12 +42,10 @@ def _to_display_df(x: pd.DataFrame | pd.Series) -> pd.DataFrame:
             df = df.reset_index(drop=True)
         except Exception:
             df = df.reset_index(drop=True)
-    # columns เป็น str ทั้งหมด
     df.columns = [str(c) for c in df.columns]
     return df
 
 def _col_of(df: pd.DataFrame | None, logical_name: str) -> str | None:
-    """หา column ที่ตรงกับ logical name แบบยืดหยุ่น"""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
     cands = {
@@ -62,18 +61,26 @@ def _col_of(df: pd.DataFrame | None, logical_name: str) -> str | None:
         k = str(key).lower()
         if k in cols_low:
             return cols_low[k]
-    # เผื่อกรณีมีคอลัมน์แบบ tuple rebased ฯลฯ
     for c in df.columns:
         s = str(c).lower()
-        if any(k in s for k in [w.lower() for w in cands]):
+        if any(k.lower() in s for k in cands):
             return str(c)
     return None
 
-def _safe_get_series(df: pd.DataFrame | None, logical_name: str) -> pd.Series:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+def _pick_monthly_series(monthly: pd.DataFrame, logical_name: str) -> pd.Series:
+    if not isinstance(monthly, pd.DataFrame) or monthly.empty:
         return pd.Series(dtype=float, name=logical_name)
-    col = _col_of(df, logical_name)
-    return df[col] if (col and col in df.columns) else pd.Series(dtype=float, name=logical_name)
+    col = _col_of(monthly, logical_name)
+    return monthly[col] if (col and col in monthly.columns) else pd.Series(dtype=float, name=logical_name)
+
+def _pick_annual_series(annual: pd.DataFrame, monthly: pd.DataFrame, logical_name: str) -> pd.Series:
+    col = _col_of(annual, logical_name) if isinstance(annual, pd.DataFrame) else None
+    if col and col in getattr(annual, "columns", []):
+        return annual[col]
+    m = _pick_monthly_series(monthly, logical_name)
+    if m.empty:
+        return pd.Series(dtype=float, name=logical_name)
+    return m.resample("A-DEC").last()
 
 def _years_span(idx: pd.DatetimeIndex) -> float:
     if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
@@ -96,31 +103,18 @@ def _cagr_from_series_any(s: pd.Series) -> float:
     except Exception:
         return np.nan
 
-def _pick_monthly_series(monthly: pd.DataFrame, logical_name: str) -> pd.Series:
-    col = _col_of(monthly, logical_name)
-    return monthly[col] if (col and col in monthly.columns) else pd.Series(dtype=float, name=logical_name)
-
-def _pick_annual_series(annual: pd.DataFrame, monthly: pd.DataFrame, logical_name: str) -> pd.Series:
-    col = _col_of(annual, logical_name) if isinstance(annual, pd.DataFrame) else None
-    if col and col in getattr(annual, "columns", []):
-        return annual[col]
-    m = _pick_monthly_series(monthly, logical_name)
-    if m.empty:
-        return pd.Series(dtype=float, name=logical_name)
-    return m.resample("A-DEC").last()
-
 def _cagr_from_any(annual: pd.DataFrame, monthly: pd.DataFrame, rebased_m: pd.DataFrame, logical_name: str) -> float:
-    # 1) annual -> หรือสร้างจาก monthly
+    # Annual first (or build from monthly)
     s_ann = _pick_annual_series(annual, monthly, logical_name)
     c = _cagr_from_series_any(s_ann)
     if pd.notna(c):
         return c
-    # 2) monthly โดยตรง
+    # Monthly direct
     s_m = _pick_monthly_series(monthly, logical_name)
     c = _cagr_from_series_any(s_m)
     if pd.notna(c):
         return c
-    # 3) rebased_m
+    # Rebased fallback
     if isinstance(rebased_m, pd.DataFrame) and not rebased_m.empty:
         map_rm = {"GLI_INDEX": "GLI", "NASDAQ": "NASDAQ", "GOLD": "GOLD"}
         rm_col = map_rm.get(logical_name, logical_name)
@@ -130,17 +124,35 @@ def _cagr_from_any(annual: pd.DataFrame, monthly: pd.DataFrame, rebased_m: pd.Da
                 return c
     return np.nan
 
-# ---------- Sidebar ----------
+def _build_rebased(monthly: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(monthly, pd.DataFrame) or monthly.empty:
+        return pd.DataFrame()
+    def _rb(s):
+        s = pd.Series(s).dropna()
+        return (s / s.iloc[0] * 100.0) if len(s) else s
+    out = pd.DataFrame()
+    gli = _pick_monthly_series(monthly, "GLI_INDEX")
+    if not gli.empty: out["GLI"] = _rb(gli)
+    for nm in ["NASDAQ", "SP500", "GOLD", "BTC", "ETH"]:
+        ser = _pick_monthly_series(monthly, nm)
+        if not ser.empty:
+            out[nm] = _rb(ser)
+    return out
+
+# =========================
+# Sidebar (no manual cache clear)
+# =========================
 st.sidebar.caption("GLI: Fed+ECB+BoJ−TGA−ONRRP (+PBoC optional)")
 start     = st.sidebar.text_input("Start (YYYY-MM-DD)", "2008-01-01")
 years_n   = st.sidebar.number_input("CAGR lookback (years)", 5, 25, 10, step=1)
 rf_annual = st.sidebar.number_input("Risk-free (annual)", 0.00, 0.10, 0.02, step=0.0025, format="%.4f")
 win_m     = st.sidebar.slider("Rolling window (months)", 6, 36, 12, step=1)
-# ปล่อย cache ของ gli_lib ทำงานเอง ไม่ clear เอง
 
 fred_key = (st.secrets.get("FRED_API_KEY", "") or os.environ.get("FRED_API_KEY","")).strip()
 
-# ---------- Load Data ----------
+# =========================
+# Load Data (cached in gli_lib)
+# =========================
 with st.spinner("Loading GLI & assets..."):
     data = gl.load_all(
         fred_api_key=fred_key,
@@ -162,34 +174,32 @@ betas_df        = data.get("betas_df")
 rebased_m       = data.get("rebased_m")
 annual_yoy_fig  = data.get("annual_yoy_fig")
 
-# กันชื่อ GLI ให้ตรง
-if monthly is not None and "GLI" in monthly.columns and "GLI_INDEX" not in monthly.columns:
+# normalize column names
+if isinstance(monthly, pd.DataFrame) and "GLI" in monthly.columns and "GLI_INDEX" not in monthly.columns:
     monthly = monthly.rename(columns={"GLI": "GLI_INDEX"})
-if monthly_rets is not None and "GLI" in monthly_rets.columns and "GLI_INDEX" not in monthly_rets.columns:
+if isinstance(monthly_rets, pd.DataFrame) and "GLI" in monthly_rets.columns and "GLI_INDEX" not in monthly_rets.columns:
     monthly_rets = monthly_rets.rename(columns={"GLI": "GLI_INDEX"})
 
-# ถ้าไม่มี rebased_m สร้างให้ (จาก monthly)
-if (rebased_m is None or not isinstance(rebased_m, pd.DataFrame) or rebased_m.empty) and isinstance(monthly, pd.DataFrame):
-    def _rebase100(s):
-        s = pd.Series(s).dropna()
-        return (s / s.iloc[0] * 100.0) if len(s) else s
-    rebased_m = pd.DataFrame({"GLI": _rebase100(_safe_get_series(monthly, "GLI_INDEX"))})
-    for nm in ["NASDAQ", "SP500", "GOLD", "BTC", "ETH"]:
-        ser = _safe_get_series(monthly, nm)
-        if not ser.empty:
-            rebased_m[nm] = _rebase100(ser)
+if not isinstance(rebased_m, pd.DataFrame) or rebased_m.empty:
+    rebased_m = _build_rebased(monthly)
 
-# ---------- Title & Tabs ----------
+# =========================
+# Title & Tabs
+# =========================
 st.title("GLI Dashboard")
 tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
     ["📈 Rebased + Annual YoY", "📉 Rolling", "🧭 Regime & Events", "📋 Tables"]
 )
 
-# ---------- KPI row ----------
+# =========================
+# KPI Row
+# =========================
 colA, colB, colC, colD, colE = st.columns(5)
 
 gli_full = _cagr_from_any(annual, monthly, rebased_m, "GLI_INDEX")
-gli_n    = gl.cagr_last_n_years(_pick_annual_series(annual, monthly, "GLI_INDEX"), int(years_n))
+# last N years CAGR (from annual if possible, else from monthly->annual)
+gli_ann_for_n = _pick_annual_series(annual, monthly, "GLI_INDEX")
+gli_n = gl.cagr_last_n_years(gli_ann_for_n, int(years_n)) if isinstance(gli_ann_for_n, pd.Series) else np.nan
 if pd.isna(gli_n):
     gli_n = gl.cagr_last_n_years(_pick_monthly_series(monthly, "GLI_INDEX").resample("A-DEC").last(), int(years_n))
 
@@ -204,11 +214,13 @@ gold_liq = (gold_full - gli_full) if pd.notna(gold_full) and pd.notna(gli_full) 
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
 colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
 
-shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) \
+shp_gli = gl.sharpe(_pick_monthly_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) \
           if (isinstance(monthly_rets, pd.DataFrame) and "GLI_INDEX" in monthly_rets.columns) else np.nan
 colE.metric("Sharpe (GLI)", f"{shp_gli:.2f}" if pd.notna(shp_gli) else "—")
 
-# ---------- Tab 1: Rebased + Annual YoY ----------
+# =========================
+# Tab 1: Rebased + Annual YoY
+# =========================
 with tab_main:
     st.subheader("(Monthly) Rebased = 100")
     if isinstance(rebased_m, pd.DataFrame) and not rebased_m.empty:
@@ -241,7 +253,6 @@ with tab_main:
 
     st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
     if annual_yoy_fig is None:
-        # fallback build
         if isinstance(monthly, pd.DataFrame) and not monthly.empty:
             ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
             ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
@@ -261,11 +272,15 @@ with tab_main:
     if annual_yoy_fig is not None:
         st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
 
-# ---------- Rolling precompute ----------
+# =========================
+# Rolling (precompute)
+# =========================
 roll = gl.rolling_corr_beta_alpha(monthly_rets, window=int(win_m))
 roll_corr_m_df, roll_beta_m_df, roll_alpha_m_df = roll["corr"], roll["beta"], roll["alpha"]
 
-# ---------- Tab 2: Rolling ----------
+# =========================
+# Tab 2: Rolling
+# =========================
 with tab_roll:
     st.subheader(f"Rolling {int(win_m)}-Month vs GLI")
     c1, c2 = st.columns(2)
@@ -300,18 +315,21 @@ with tab_roll:
                          xaxis=dict(rangeslider=dict(visible=True)))
     st.plotly_chart(fig_ra, use_container_width=True, config={"displaylogo": False})
 
-# ---------- Regime precompute ----------
+# =========================
+# Regime (precompute)
+# =========================
 reg = gl.regime_and_events(monthly, monthly_rets)
 regime_df      = reg["regime_df"]
 exp_periods    = reg["expansion_periods"]
 evt_up         = reg["evt_up"]
 evt_down       = reg["evt_down"]
 
-# ---------- Tab 3: Regime & Events ----------
+# =========================
+# Tab 3: Regime & Events
+# =========================
 with tab_regime:
     st.subheader("GLI Regime (YoY>0) & Event Study")
 
-    # Rebased + shaded expansion
     if isinstance(rebased_m, pd.DataFrame) and not rebased_m.empty:
         fig_reg = go.Figure()
         for col in rebased_m.columns:
@@ -323,7 +341,6 @@ with tab_regime:
                               xaxis=dict(rangeslider=dict(visible=True)))
         st.plotly_chart(fig_reg, use_container_width=True, config={"displaylogo": False})
 
-    # GLI YoY vs GOLD %/mo (dual axis)
     fig_gold_yoy = gl.gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods)
     st.plotly_chart(fig_gold_yoy, use_container_width=True, config={"displaylogo": False})
 
@@ -339,7 +356,9 @@ with tab_regime:
     st.markdown("#### 📌 Auto Summary")
     st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, gl.perf_regime_table(monthly_rets, regime_df)))
 
-# ---------- Tab 4: Tables ----------
+# =========================
+# Tab 4: Tables
+# =========================
 with tab_tables:
     st.subheader("Tables (compact)")
     with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
