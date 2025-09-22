@@ -32,6 +32,24 @@ with st.spinner("Loading GLI & assets..."):
         pboc_series_id=None
     )
 
+def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [str(t[0]) if isinstance(t, tuple) else str(t) for t in df.columns]
+    else:
+        df = df.copy()
+        df.columns = [str(c) for c in df.columns]
+    return df
+
+rebased_m     = _flatten_cols(rebased_m)
+monthly       = _flatten_cols(monthly)
+monthly_rets  = _flatten_cols(monthly_rets)
+annual        = _flatten_cols(annual)
+corr_matrix   = _flatten_cols(corr_matrix) if isinstance(corr_matrix, pd.DataFrame) else corr_matrix
+betas_df.index = betas_df.index.map(str)
+
+
+
 wk              = data["wk"]                 # weekly GLI proxy
 monthly         = data["monthly"]            # GLI_INDEX + assets (M close)
 monthly_rets    = data["monthly_rets"]       # %/mo
@@ -81,20 +99,28 @@ tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
 with tab_main:
     st.subheader("(Monthly) GLI vs NASDAQ / S&P500 / GOLD / BTC / ETH — Rebased = 100")
 
-    # Toggle buttons (ไม่บังกราฟ)
-    btns = set(st.multiselect(
-    "เลือกเส้นที่ต้องการแสดง",
-    options=list(rebased_m.columns),
-    default=list(rebased_m.columns),
-    key="rebased_sel",
-    help="ซ่อน/แสดงซีรีส์ที่ต้องการเปรียบเทียบ"
-))
+    # map label(str) -> actual column
+    col_map = {str(c): c for c in rebased_m.columns}
+    labels  = list(col_map.keys())
+
+    sel = set(st.multiselect(
+        "เลือกเส้นที่ต้องการแสดง",
+        options=labels,
+        default=labels,
+        key="rebased_sel",
+        help="ซ่อน/แสดงซีรีส์ที่ต้องการเปรียบเทียบ"
+    ))
 
     fig_rebase = go.Figure()
-    for col in rebased_m.columns:
+    for label, col in col_map.items():
         fig_rebase.add_trace(
-            go.Scatter(x=rebased_m.index, y=rebased_m[col], mode="lines", name=col,
-                       visible=True if col in btns else "legendonly")
+            go.Scatter(
+                x=rebased_m.index,
+                y=rebased_m[col],
+                mode="lines",
+                name=label,                        # <== ชื่อเป็นสตริงแน่ๆ
+                visible=True if label in sel else "legendonly"
+            )
         )
     fig_rebase.update_layout(
         title="(Monthly) Rebased=100",
@@ -107,7 +133,6 @@ with tab_main:
     st.plotly_chart(fig_rebase, use_container_width=True, config={"displaylogo": False})
 
     st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
-        # >>> วางบล็อก fallback ตรงนี้ <<<
     if annual_yoy_fig is None:
         ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
         ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
@@ -121,9 +146,8 @@ with tab_main:
                           legend=dict(orientation="h", y=1.05),
                           xaxis=dict(rangeslider=dict(visible=True)))
         annual_yoy_fig = fig
-
-    # แล้วค่อยแสดงกราฟ (จะใช้ของจริงจาก gli_lib ถ้ามี หรือใช้ fallback ถ้า None)
     st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
+
 
 # ---------- Tab 2: Rolling ----------
 with tab_roll:
