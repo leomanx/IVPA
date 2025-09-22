@@ -1,4 +1,3 @@
-# pages/02_GLI_Dashboard.py
 import os, math
 import streamlit as st
 import pandas as pd
@@ -83,13 +82,13 @@ with tab_main:
     st.subheader("(Monthly) GLI vs NASDAQ / S&P500 / GOLD / BTC / ETH — Rebased = 100")
 
     # Toggle buttons (ไม่บังกราฟ)
-    btns = st.multiselect(
-        "เลือกเส้นที่ต้องการแสดง",
-        options=list(rebased_m.columns),
-        default=list(rebased_m.columns),
-        key="rebased_sel",
-        help="ซ่อน/แสดงซีรีส์ที่ต้องการเปรียบเทียบ"
-    )
+    btns = set(st.multiselect(
+    "เลือกเส้นที่ต้องการแสดง",
+    options=list(rebased_m.columns),
+    default=list(rebased_m.columns),
+    key="rebased_sel",
+    help="ซ่อน/แสดงซีรีส์ที่ต้องการเปรียบเทียบ"
+))
 
     fig_rebase = go.Figure()
     for col in rebased_m.columns:
@@ -108,6 +107,22 @@ with tab_main:
     st.plotly_chart(fig_rebase, use_container_width=True, config={"displaylogo": False})
 
     st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
+        # >>> วางบล็อก fallback ตรงนี้ <<<
+    if annual_yoy_fig is None:
+        ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
+        ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=ann.index, y=ann["GLI_%YoY"],
+                                 mode="lines+markers", name="GLI_%YoY"))
+        for c in [c for c in ann.columns if c != "GLI_%YoY"]:
+            fig.add_trace(go.Bar(x=ann.index, y=ann[c], name=f"{c}_%YoY"))
+        fig.update_layout(title="Annual YoY: GLI (line) vs Assets (bars)",
+                          barmode="group", hovermode="x unified",
+                          legend=dict(orientation="h", y=1.05),
+                          xaxis=dict(rangeslider=dict(visible=True)))
+        annual_yoy_fig = fig
+
+    # แล้วค่อยแสดงกราฟ (จะใช้ของจริงจาก gli_lib ถ้ามี หรือใช้ fallback ถ้า None)
     st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
 
 # ---------- Tab 2: Rolling ----------
