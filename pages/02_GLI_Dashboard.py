@@ -75,6 +75,26 @@ def _safe_get_series(df: pd.DataFrame, col: str) -> pd.Series:
         return df[col]
     return pd.Series(dtype=float)
 
+def _pick_col(df: pd.DataFrame, candidates) -> str | None:
+    """เลือกคอลัมน์แบบยืดหยุ่น (รับทั้งชื่อเดี่ยว หรือชื่อที่ถูกแปลงจาก MultiIndex เช่น 'NASDAQ - 0')."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    cols = [str(c) for c in df.columns]
+
+    # ตรงตัวก่อน
+    for t in candidates:
+        if t in cols:
+            return t
+
+    # แบบ contains / ขอบ-กลาง (รองรับพวก "('NASDAQ', 0)" -> ถูก flatten เป็น "NASDAQ - 0")
+    low_cols = [c.lower() for c in cols]
+    for t in candidates:
+        t_low = str(t).lower()
+        for i, c_low in enumerate(low_cols):
+            if (t_low in c_low) or c_low.startswith(t_low + " -") or c_low.endswith("- " + t_low):
+                return cols[i]
+    return None
+
 # ---------------- Sidebar ----------------
 st.sidebar.caption("GLI: Fed + ECB + BoJ − TGA − ONRRP (+PBoC optional)")
 start     = st.sidebar.text_input("Start (YYYY-MM-DD)", "2008-01-01")
@@ -158,11 +178,16 @@ st.title("GLI Dashboard")
 
 # ---------------- KPI row ----------------
 colA, colB, colC, colD, colE = st.columns(5)
+
 gli_full = gl.cagr_from_series(_safe_get_series(annual, "GLI_INDEX"))
 gli_n    = gl.cagr_last_n_years(_safe_get_series(annual, "GLI_INDEX"), int(years_n))
 
-nas_full = gl.cagr_from_series(_safe_get_series(annual, "NASDAQ"))
-gold_full= gl.cagr_from_series(_safe_get_series(annual, "GOLD"))
+# --- เลือกคอลัมน์ NASDAQ / GOLD แบบยืดหยุ่น ---
+nas_col  = _pick_col(annual, ["NASDAQ", "NDX", "IXIC"])
+gold_col = _pick_col(annual, ["GOLD", "GC=F", "XAUUSD"])
+
+nas_full  = gl.cagr_from_series(_safe_get_series(annual, nas_col))  if nas_col  else np.nan
+gold_full = gl.cagr_from_series(_safe_get_series(annual, gold_col)) if gold_col else np.nan
 
 colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
 colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
@@ -171,7 +196,7 @@ colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
 nas_liq = (nas_full - gli_full) if (pd.notna(nas_full) and pd.notna(gli_full)) else np.nan
 gold_liq= (gold_full - gli_full) if (pd.notna(gold_full) and pd.notna(gli_full)) else np.nan
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
-colD.metric("GOLD − GLI (CAGR)", _fmt_pct(gold_liq))
+colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
 
 shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) if "GLI_INDEX" in monthly_rets.columns else np.nan
 colE.metric("Sharpe (GLI)", f"{shp_gli:.2f}" if pd.notna(shp_gli) else "—")
@@ -289,7 +314,6 @@ with tab_regime:
     try:
         perf_tbl = gl.perf_regime_table(monthly_rets, regime_df)
         summary_txt = gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, perf_tbl)
-        # ทำความสะอาดชื่อ tuple ที่อาจหลุดมา
         summary_txt = summary_txt.replace("('", "").replace("')", "").replace(" - ", " ").replace("_%/mo", "")
         st.markdown("#### 📌 Auto Summary")
         st.info(summary_txt)
@@ -308,7 +332,6 @@ with tab_tables:
     c1, c2 = st.columns([3,2], vertical_alignment="top")
     with c1:
         if isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.empty:
-            # Limit to 30x30 for readability
             cm = corr_matrix.copy()
             if cm.shape[0] > 30:
                 cm = cm.iloc[:30, :30]
