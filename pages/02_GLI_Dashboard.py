@@ -286,10 +286,12 @@ with tab_regime:
             safe_df_for_st(evt_down.round(2)).reset_index().rename(columns={'index': 'Asset'}),
             use_container_width=True
         )
-
-    # Auto summary (Thai)
-    st.markdown("#### 📌 สรุปอัตโนมัติ")
-    st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, gl.perf_regime_table(monthly_rets, regime_df)))
+        
+# -------- Summary --------
+perf_tbl = gl.perf_regime_table(monthly_rets, regime_df)
+summary_text = _make_summary(metrics_table, betas_df, evt_up, evt_down, perf_tbl)
+st.markdown("#### 📌 Summary")
+st.info(summary_text)
 
 # ---------- Pretty summary (replace the old auto summary block) ----------
 def _pretty_name(x):
