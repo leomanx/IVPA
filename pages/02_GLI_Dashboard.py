@@ -319,17 +319,18 @@ with tab_regime:
 with tab_tables:
     st.subheader("Tables (compact)")
     with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
-        st.dataframe(metrics_table if isinstance(metrics_table, pd.DataFrame) else pd.DataFrame(),
-                     use_container_width=True, height=340)
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
-            df_show = corr_matrix.round(2) if isinstance(corr_matrix, pd.DataFrame) else pd.DataFrame()
-            st.dataframe(df_show, use_container_width=True, height=350)
-    with col2:
-        with st.expander("β vs GLI (Monthly OLS)", expanded=False):
-            df_show = betas_df.round(3) if isinstance(betas_df, pd.DataFrame) else pd.DataFrame()
-            st.dataframe(df_show, use_container_width=True, height=350)
-    with st.expander("📈 Monthly closes (preview)", expanded=False):
-        st.dataframe(monthly.tail(12) if isinstance(monthly, pd.DataFrame) else pd.DataFrame(),
-                     use_container_width=True, height=320)
+    st.dataframe(_sanitize_for_st(metrics_table), use_container_width=True, height=340)
+
+with col1:
+    with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
+        st.dataframe(_sanitize_for_st(corr_matrix.round(2) if isinstance(corr_matrix, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True, height=350)
+
+with col2:
+    with st.expander("β vs GLI (Monthly OLS)", expanded=False):
+        st.dataframe(_sanitize_for_st(betas_df.round(3) if isinstance(betas_df, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True, height=350)
+
+with st.expander("📈 Monthly closes (preview)", expanded=False):
+    st.dataframe(_sanitize_for_st(monthly.tail(12) if isinstance(monthly, pd.DataFrame) else pd.DataFrame()),
+                 use_container_width=True, height=320)
