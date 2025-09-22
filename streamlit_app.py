@@ -14,9 +14,9 @@ st.markdown("""
 st.subheader("Pages")
 cols = st.columns(2)
 with cols[0]:
-    st.page_link("pages/IVP-Analyzer.py", label="📊 IVP Analyzer", icon="📊")
+    st.page_link("pages/IVP-Analyzer.py", label="📊 IVP Analyzer")
 with cols[1]:
-    st.page_link("pages/02_GLI_Dashboard.py", label="🌊 GLI Dashboard", icon="🌊")
+    st.page_link("pages/02_GLI_Dashboard.py", label="🌊 GLI Dashboard")
 
 # ----- Environment / Secrets check -----
 fred_key = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", "")).strip()
