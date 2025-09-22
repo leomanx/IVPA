@@ -246,32 +246,63 @@ except:
 # Debug info (แสดงค่าใน sidebar เพื่อตรวจสอบ)
 with st.sidebar:
     st.write("Debug Info:")
-    st.write(f"GLI CAGR: {gli_full}")
-    st.write(f"NASDAQ CAGR: {nas_full}")
-    st.write(f"GOLD CAGR: {gold_full}")
+    st.write(f"GLI CAGR: {gli_full} (type: {type(gli_full)})")
+    st.write(f"NASDAQ CAGR: {nas_full} (type: {type(nas_full)})")
+    st.write(f"GOLD CAGR: {gold_full} (type: {type(gold_full)})")
     st.write(f"GLI series length: {len(gli_ser_a)}")
     st.write(f"NASDAQ series length: {len(nas_ser_a)}")
     st.write(f"GOLD series length: {len(gold_ser_a)}")
     
     # แสดงคอลัมน์ที่พบ
-    st.write("Found columns:")
-    st.write(f"GLI: {_col_of(monthly, 'GLI_INDEX')}")
-    st.write(f"NASDAQ: {_col_of(monthly, 'NASDAQ')}")
-    st.write(f"GOLD: {_col_of(monthly, 'GOLD')}")
+    st.write("Found columns in monthly:")
+    if isinstance(monthly, pd.DataFrame):
+        st.write(list(monthly.columns))
+        st.write(f"GLI col: {_col_of(monthly, 'GLI_INDEX')}")
+        st.write(f"NASDAQ col: {_col_of(monthly, 'NASDAQ')}")
+        st.write(f"GOLD col: {_col_of(monthly, 'GOLD')}")
+    
+    # แสดงคอลัมน์ที่พบใน annual  
+    st.write("Found columns in annual:")
+    if isinstance(annual, pd.DataFrame):
+        st.write(list(annual.columns))
+    
+    # แสดงตัวอย่างข้อมูล
+    if not gli_ser_a.empty:
+        st.write(f"GLI first/last: {gli_ser_a.iloc[0]:.2f} / {gli_ser_a.iloc[-1]:.2f}")
+    if not nas_ser_a.empty:
+        st.write(f"NASDAQ first/last: {nas_ser_a.iloc[0]:.2f} / {nas_ser_a.iloc[-1]:.2f}")
+    if not gold_ser_a.empty:
+        st.write(f"GOLD first/last: {gold_ser_a.iloc[0]:.2f} / {gold_ser_a.iloc[-1]:.2f}")
 
 # แสดง KPIs
 colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
 colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
 
-# คำนวณ liquidity premium
+# คำนวณ liquidity premium - แก้ใหม่
 nas_liq = np.nan
 gold_liq = np.nan
 
-if pd.notna(nas_full) and pd.notna(gli_full):
-    nas_liq = nas_full - gli_full
+st.sidebar.write(f"Before calc - GLI: {gli_full}, NASDAQ: {nas_full}, GOLD: {gold_full}")
 
-if pd.notna(gold_full) and pd.notna(gli_full):
-    gold_liq = gold_full - gli_full
+# ตรวจสอบและคำนวณ NASDAQ - GLI
+if gli_full is not None and nas_full is not None and not pd.isna(gli_full) and not pd.isna(nas_full):
+    try:
+        nas_liq = float(nas_full) - float(gli_full)
+        st.sidebar.write(f"NASDAQ - GLI calculated: {nas_liq}")
+    except Exception as e:
+        st.sidebar.write(f"Error calc NASDAQ-GLI: {e}")
+else:
+    st.sidebar.write(f"Cannot calc NASDAQ-GLI: GLI={gli_full}, NASDAQ={nas_full}")
+
+# ตรวจสอบและคำนวณ GOLD - GLI  
+if gli_full is not None and gold_full is not None and not pd.isna(gli_full) and not pd.isna(gold_full):
+    try:
+        gold_liq = float(gold_full) - float(gli_full)
+        st.sidebar.write(f"GOLD - GLI calculated: {gold_liq}")
+    except Exception as e:
+        st.sidebar.write(f"Error calc GOLD-GLI: {e}")
+else:
+    st.sidebar.write(f"Cannot calc GOLD-GLI: GLI={gli_full}, GOLD={gold_full}")
 
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
 colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
