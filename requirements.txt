@@ -7,3 +7,5 @@ requests>=2.31
 plotly>=5.22
 kaleido>=0.2
 scipy>=1.11
+fredapi>=0.5
+statsmodels>=0.14
