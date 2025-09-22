@@ -6,7 +6,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
-import gli_lib as gl  # ต้องมีไฟล์ gli_lib.py ตามที่เราแยกไว้
+import gli_lib as gl
 
 st.set_page_config(page_title="GLI Dashboard", layout="wide")
 
