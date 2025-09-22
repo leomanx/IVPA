@@ -26,6 +26,39 @@ def _flatten_cols(obj):
         return df
     return obj  # other types untouched
 
+def _sanitize_for_st(df: pd.DataFrame) -> pd.DataFrame:
+    """ทำความสะอาด df เพื่อให้ st.dataframe แปลงเป็น Arrow ได้ไม่พัง"""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    d = df.copy()
+
+    # เปลี่ยน inf เป็น NaN ก่อน
+    d = d.replace([np.inf, -np.inf], np.nan)
+
+    # บังคับชื่อคอลัมน์และ index เป็นสตริง
+    d.columns = [str(c) for c in d.columns]
+    try:
+        d.index = d.index.map(str)
+    except Exception:
+        pass
+
+    # แปลงคอลัมน์ object → numeric ถ้าได้; ไม่ได้ให้เป็น string
+    for c in d.columns:
+        s = d[c]
+        if pd.api.types.is_object_dtype(s) or getattr(s, "dtype", None) == "Sparse[int]":
+            try:
+                s_num = pd.to_numeric(s, errors="coerce")
+                # ถ้าแปลงเป็นตัวเลขได้ ≥ 50% ให้ใช้ numeric; ไม่งั้นใช้ string
+                if s_num.notna().mean() >= 0.5:
+                    d[c] = s_num
+                else:
+                    d[c] = s.astype(str)
+            except Exception:
+                d[c] = s.astype(str)
+
+    return d
+
 def _fmt_pct(x):
     return "—" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
 
