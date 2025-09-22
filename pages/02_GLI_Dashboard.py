@@ -291,6 +291,95 @@ with tab_regime:
     st.markdown("#### 📌 สรุปอัตโนมัติ")
     st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, gl.perf_regime_table(monthly_rets, regime_df)))
 
+# ---------- Pretty summary (replace the old auto summary block) ----------
+def _pretty_name(x):
+    # tuple -> ใช้สมาชิกตัวแรก
+    if isinstance(x, tuple) and len(x) > 0:
+        x = x[0]
+    s = str(x)
+    # map ให้สั้นและสวย
+    m = {
+        "GLI": "GLI",
+        "NASDAQ": "NASDAQ",
+        "SP500": "S&P 500",
+        "GOLD": "Gold",
+        "BTC": "Bitcoin",
+        "ETH": "Ethereum",
+    }
+    # เผื่อเคสเป็นสตริงรวม เช่น "('GOLD','GC=F')"
+    for k, v in m.items():
+        if k in s:
+            return v
+    return s
+
+def _safe_top_names(series, n=2):
+    """รับ Series (index=asset, value=metric) -> คืนรายชื่อ top n แบบสวย"""
+    if series is None or len(series.dropna()) == 0:
+        return []
+    return [_pretty_name(idx) for idx in series.dropna().sort_values(ascending=False).head(n).index]
+
+def _make_summary(metrics_table, betas_df, evt_up, evt_down, perf_regime_tbl):
+    lines = []
+
+    # 1) Past — Liquidity-Adjusted CAGR
+    try:
+        mt = metrics_table.copy()
+        if "Asset" in mt.columns:
+            mt = mt.set_index("Asset")
+        liq_cols = [c for c in mt.columns if "LiquidityAdj_CAGR" in c]
+        if len(liq_cols) >= 1:
+            liq_mean = mt[liq_cols].mean(axis=1)
+            past_top = _safe_top_names(liq_mean, 2)
+            past_bot = _safe_top_names(-liq_mean, 1)  # แย่สุด = ค่าน้อยสุด
+            if past_top:
+                lines.append(f"- **อดีต**: เด่นสุด {', '.join(past_top)}; แผ่วสุด {', '.join(past_bot) if past_bot else '—'}")
+            else:
+                lines.append("- **อดีต**: ข้อมูลยังไม่พอ")
+        else:
+            lines.append("- **อดีต**: ข้อมูลยังไม่พอ")
+    except Exception:
+        lines.append("- **อดีต**: ข้อมูลยังไม่พอ")
+
+    # 2) Present — Beta สูง/ต่ำ
+    try:
+        bd = betas_df.copy()
+        if "Beta_vs_GLI" in bd.columns and len(bd) > 0:
+            bd2 = bd["Beta_vs_GLI"].dropna()
+            if len(bd2) > 0:
+                hi = _pretty_name(bd2.idxmax())
+                lo = _pretty_name(bd2.idxmin())
+                lines.append(f"- **ปัจจุบัน**: เบต้าเทียบ GLI สูงสุด **{hi}** | ต่ำสุด **{lo}**")
+            else:
+                lines.append("- **ปัจจุบัน**: ข้อมูลยังไม่พอ")
+        else:
+            lines.append("- **ปัจจุบัน**: ข้อมูลยังไม่พอ")
+    except Exception:
+        lines.append("- **ปัจจุบัน**: ข้อมูลยังไม่พอ")
+
+    # 3) Forward — Regime tilt
+    try:
+        pr = perf_regime_tbl["Avg_%/mo"] if ("Avg_%/mo" in perf_regime_tbl) else None
+        if pr is not None and (True in pr.index) and (False in pr.index):
+            exp_winners = _safe_top_names(pr.loc[True], 2)
+            con_winners = _safe_top_names(pr.loc[False], 2)
+            lines.append(
+                "- **อนาคต (ตามสถานการณ์)**: "
+                f"ถ้า GLI **ขยาย** → เน้น {', '.join(exp_winners) if exp_winners else '—'}; "
+                f"ถ้า GLI **หด** → เน้น {', '.join(con_winners) if con_winners else '—'}"
+            )
+        else:
+            lines.append("- **อนาคต**: ข้อมูลยังไม่พอ")
+    except Exception:
+        lines.append("- **อนาคต**: ข้อมูลยังไม่พอ")
+
+    return "สรุปย่อ (รายเดือน)\n" + "\n".join(lines)
+
+# ใช้งาน:
+perf_tbl = gl.perf_regime_table(monthly_rets, regime_df)
+summary_text = _make_summary(metrics_table, betas_df, evt_up, evt_down, perf_tbl)
+st.markdown("#### 📌 Auto Summary")
+st.info(summary_text)
+
 # ---------- Tab 4: Tables ----------
 with tab_tables:
     st.subheader("Tables")
