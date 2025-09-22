@@ -32,9 +32,42 @@ def _to_display_df(df: pd.DataFrame) -> pd.DataFrame:
     """ทำ DF ให้ปลอดภัยต่อ st.dataframe/Arrow (รวม MultiIndex, Period/Datetime index, object dtype)."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
-
     out = df.copy()
 
+def _col_of(df: pd.DataFrame, logical_name: str) -> str | None:
+    """คืนชื่อคอลัมน์จริงใน df ตาม logical_name ('GLI_INDEX','NASDAQ','GOLD') แบบยืดหยุ่น"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    cols = [str(c) for c in df.columns]
+
+    ALIASES = {
+        "GLI_INDEX": ["GLI_INDEX", "GLI", "GLI INDEX"],
+        "NASDAQ":    ["NASDAQ", "^IXIC", "NDX", "NASDAQCOM"],
+        "GOLD":      ["GOLD", "GC=F", "XAU", "XAUUSD", "GLD"],
+    }
+    targets = [logical_name] + ALIASES.get(logical_name, [])
+
+    # ตรงเป๊ะก่อน
+    for t in targets:
+        for c in cols:
+            if c.strip().upper() == t.strip().upper():
+                return c
+    # หากมีคำเป้าหมายอยู่ในชื่อคอลัมน์ (เช่น 'NASDAQ: FRED (NASDAQCOM)')
+    for t in targets:
+        tU = t.strip().upper()
+        for c in cols:
+            if tU in c.strip().upper():
+                return c
+    return None
+
+def _pick_series(df: pd.DataFrame, logical_name: str) -> pd.Series:
+    """คืน Series ตาม logical_name; ถ้าไม่เจอใน annual จะลอง resample จาก monthly"""
+    col = _col_of(df, logical_name) if isinstance(df, pd.DataFrame) else None
+    if col and col in df.columns:
+        return df[col]
+    return pd.Series(dtype=float)
+
+  
     # --- normalize index ---
     if isinstance(out.index, pd.MultiIndex):
         out = out.reset_index()
@@ -158,28 +191,52 @@ st.title("GLI Dashboard")
 
 # ---------------- KPI row ----------------
 colA, colB, colC, colD, colE = st.columns(5)
-gli_full = gl.cagr_from_series(_safe_get_series(annual, "GLI_INDEX"))
-gli_n    = gl.cagr_last_n_years(_safe_get_series(annual, "GLI_INDEX"), int(years_n))
 
-nas_full = gl.cagr_from_series(_safe_get_series(annual, "NASDAQ"))
-gold_full= gl.cagr_from_series(_safe_get_series(annual, "GOLD"))
+# หา column จริงแบบยืดหยุ่นใน annual; ถ้าไม่มีให้ fallback จาก monthly → annual
+def _annual_series_from_monthly(monthly_df: pd.DataFrame, logical_name: str) -> pd.Series:
+    if not isinstance(monthly_df, pd.DataFrame) or monthly_df.empty:
+        return pd.Series(dtype=float)
+    col = _col_of(monthly_df, logical_name)
+    if not col:
+        return pd.Series(dtype=float)
+    try:
+        return monthly_df[[col]].resample("A-DEC").last()[col]
+    except Exception:
+        return pd.Series(dtype=float)
+
+gli_col   = _col_of(annual, "GLI_INDEX") or _col_of(monthly, "GLI_INDEX")
+nas_col   = _col_of(annual, "NASDAQ")    or _col_of(monthly, "NASDAQ")
+gold_col  = _col_of(annual, "GOLD")      or _col_of(monthly, "GOLD")
+
+gli_ser_a  = _pick_series(annual, "GLI_INDEX")
+nas_ser_a  = _pick_series(annual, "NASDAQ")
+gold_ser_a = _pick_series(annual, "GOLD")
+
+# fallback จาก monthly ถ้าชุด annual ไม่มี
+if gli_ser_a.empty and gli_col:
+    gli_ser_a = _annual_series_from_monthly(monthly, "GLI_INDEX")
+if nas_ser_a.empty and nas_col:
+    nas_ser_a = _annual_series_from_monthly(monthly, "NASDAQ")
+if gold_ser_a.empty and gold_col:
+    gold_ser_a = _annual_series_from_monthly(monthly, "GOLD")
+
+# คำนวณ CAGR (ถ้ามีข้อมูลอย่างน้อย 2 จุด)
+gli_full = gl.cagr_from_series(gli_ser_a)
+gli_n    = gl.cagr_last_n_years(gli_ser_a, int(years_n))
+nas_full = gl.cagr_from_series(nas_ser_a)
+gold_full= gl.cagr_from_series(gold_ser_a)
 
 colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
 colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
 
-# Liquidity-adjusted (asset − GLI)
-nas_liq = (nas_full - gli_full) if (pd.notna(nas_full) and pd.notna(gli_full)) else np.nan
-gold_liq= (gold_full - gli_full) if (pd.notna(gold_full) and pd.notna(gli_full)) else np.nan
+nas_liq  = (nas_full  - gli_full)  if (pd.notna(nas_full)  and pd.notna(gli_full))  else np.nan
+gold_liq = (gold_full - gli_full)  if (pd.notna(gold_full) and pd.notna(gli_full)) else np.nan
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
-colD.metric("GOLD − GLI (CAGR)", _fmt_pct(gold_liq))
+colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
 
-shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) if "GLI_INDEX" in monthly_rets.columns else np.nan
+shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) if isinstance(monthly_rets, pd.DataFrame) and "GLI_INDEX" in monthly_rets.columns else np.nan
 colE.metric("Sharpe (GLI)", f"{shp_gli:.2f}" if pd.notna(shp_gli) else "—")
 
-# ---------------- Tabs ----------------
-tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
-    ["📈 Overview", "📉 Rolling", "🧭 Regime", "📋 Tables"]
-)
 
 # ---------- Tab: Overview ----------
 with tab_main:
