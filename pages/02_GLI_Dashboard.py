@@ -39,14 +39,28 @@ def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
         return new
     return df
 
+# ---------- Helper: safe for st.dataframe ----------
 def _to_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """แปลง object/tuple ให้เป็น string สำหรับ st.dataframe (กัน pyarrow error)"""
+    """ทำให้ DataFrame ปลอดภัยต่อ st.dataframe/Arrow."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
     out = df.copy()
+
+    # เอา index แปลก ๆ ออกมาก่อน แล้ว reset ให้เรียบ
+    if not isinstance(out.index, pd.RangeIndex):
+        out.insert(0, "Index", out.index.astype(str))
+        out = out.reset_index(drop=True)
+
+    # ชื่อคอลัมน์เป็น string ล้วน
+    out.columns = [str(c) for c in out.columns]
+
+    # คอลัมน์ object -> primitive/string
     for c in out.columns:
-        if out[c].dtype == "object":
-            out[c] = out[c].astype(str)
+        if pd.api.types.is_object_dtype(out[c]):
+            out[c] = out[c].apply(lambda v: v.item() if isinstance(v, np.generic) else v)
+            out[c] = out[c].apply(
+                lambda v: v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+            )
     return out
 
 def _pretty_name(s: str) -> str:
@@ -292,8 +306,10 @@ with tab_regime:
 # ---------- Tab 4 ----------
 with tab_tables:
     st.subheader("Tables (compact)")
+
     with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
         st.dataframe(_to_display_df(metrics_table), use_container_width=True, height=340)
+
     col1, col2 = st.columns(2)
     with col1:
         with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
@@ -301,5 +317,7 @@ with tab_tables:
     with col2:
         with st.expander("β vs GLI (Monthly OLS)", expanded=False):
             st.dataframe(_to_display_df(betas_df.round(3)), use_container_width=True, height=350)
+
     with st.expander("📈 Monthly closes (preview)", expanded=False):
         st.dataframe(_to_display_df(monthly.tail(12)), use_container_width=True, height=320)
+
