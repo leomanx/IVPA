@@ -1,23 +1,43 @@
+# pages/02_GLI_Dashboard.py
 import os, math
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 
 import gli_lib as gl
 
 st.set_page_config(page_title="GLI Dashboard", layout="wide")
 
+# ---------------- Helpers (safe/flatten) ----------------
+def _flatten_cols(obj):
+    """Return object with string/flat columns. Safe for None/Series/DataFrame."""
+    if obj is None:
+        return None
+    if isinstance(obj, pd.Series):
+        name = str(obj.name) if obj.name is not None else "value"
+        return obj.to_frame(name)
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join([str(x) for x in tup]).strip() for tup in df.columns]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        return df
+    return obj  # other types untouched
+
+def _fmt_pct(x):
+    return "—" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
+
 # ---------------- Sidebar ----------------
-st.sidebar.caption("GLI: Fed+ECB+BoJ−TGA−ONRRP (+PBoC optional)")
+st.sidebar.caption("GLI: Fed+ECB+BoJ − TGA − ONRRP (+PBoC optional)")
 start     = st.sidebar.text_input("Start (YYYY-MM-DD)", "2008-01-01")
 years_n   = st.sidebar.number_input("CAGR lookback (years)", 5, 25, 10, step=1)
 rf_annual = st.sidebar.number_input("Risk-free (annual)", 0.00, 0.10, 0.02, step=0.0025, format="%.4f")
 win_m     = st.sidebar.slider("Rolling window (months)", 6, 36, 12, step=1)
-st.sidebar.button("🔄 Refresh cache", on_click=lambda: st.cache_data.clear())
+st.sidebar.button("🔄 Refresh cache", on_click=st.cache_data.clear)
 
-# FRED key: อ่านจาก secrets > env > input
+# FRED key: secrets > env
 fred_key = (st.secrets.get("FRED_API_KEY", "") or os.environ.get("FRED_API_KEY","")).strip()
 
 # ---------------- Load data ----------------
@@ -32,65 +52,90 @@ with st.spinner("Loading GLI & assets..."):
         pboc_series_id=None
     )
 
-def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = [str(t[0]) if isinstance(t, tuple) else str(t) for t in df.columns]
-    else:
-        df = df.copy()
-        df.columns = [str(c) for c in df.columns]
-    return df
+# unpack
+wk              = data.get("wk")
+monthly         = data.get("monthly")
+monthly_rets    = data.get("monthly_rets")
+annual          = data.get("annual")
+metrics_table   = data.get("metrics_table")
+corr_matrix     = data.get("corr_matrix")
+betas_df        = data.get("betas_df")
+rebased_m       = data.get("rebased_m")
+annual_yoy_fig  = data.get("annual_yoy_fig")
 
-rebased_m     = _flatten_cols(rebased_m)
+# normalize/flatten
 monthly       = _flatten_cols(monthly)
 monthly_rets  = _flatten_cols(monthly_rets)
 annual        = _flatten_cols(annual)
-corr_matrix   = _flatten_cols(corr_matrix) if isinstance(corr_matrix, pd.DataFrame) else corr_matrix
-betas_df.index = betas_df.index.map(str)
+rebased_m     = _flatten_cols(rebased_m)
+if isinstance(corr_matrix, pd.DataFrame):
+    corr_matrix = _flatten_cols(corr_matrix)
+if isinstance(betas_df, pd.DataFrame):
+    try:
+        betas_df.index = betas_df.index.map(str)
+    except Exception:
+        pass
 
+# defensive guards
+if monthly is None or monthly.empty:
+    st.error("ไม่พบข้อมูลรายเดือน (monthly) — ตรวจ API/เน็ต แล้วลอง Refresh cache")
+    st.stop()
+if rebased_m is None or rebased_m.empty:
+    # สร้างจาก monthly หากไม่มี
+    try:
+        cols = [c for c in monthly.columns if c]  # all
+        rebased_m = pd.DataFrame({ c: (monthly[c]/monthly[c].dropna().iloc[0])*100.0 for c in cols if monthly[c].dropna().size })
+    except Exception:
+        st.error("สร้าง rebased panel ไม่สำเร็จ")
+        st.stop()
 
+# rolling stats
+try:
+    roll = gl.rolling_corr_beta_alpha(monthly_rets, window=win_m)
+    roll_corr_m_df, roll_beta_m_df, roll_alpha_m_df = roll["corr"], roll["beta"], roll["alpha"]
+    roll_corr_m_df  = _flatten_cols(roll_corr_m_df)
+    roll_beta_m_df  = _flatten_cols(roll_beta_m_df)
+    roll_alpha_m_df = _flatten_cols(roll_alpha_m_df)
+except Exception as e:
+    roll_corr_m_df = roll_beta_m_df = roll_alpha_m_df = pd.DataFrame()
+    st.warning(f"คำนวณ rolling ไม่สำเร็จ: {e}")
 
-wk              = data["wk"]                 # weekly GLI proxy
-monthly         = data["monthly"]            # GLI_INDEX + assets (M close)
-monthly_rets    = data["monthly_rets"]       # %/mo
-annual          = data["annual"]             # A-DEC close
-metrics_table   = data["metrics_table"]      # summary table
-corr_matrix     = data["corr_matrix"]
-betas_df        = data["betas_df"]
-rebased_m       = data["rebased_m"]          # for plotting
-annual_yoy_fig  = data["annual_yoy_fig"]     # GLI (line) vs assets (bars)
-
-roll = gl.rolling_corr_beta_alpha(monthly_rets, window=win_m)
-roll_corr_m_df, roll_beta_m_df, roll_alpha_m_df = roll["corr"], roll["beta"], roll["alpha"]
-
-reg = gl.regime_and_events(monthly, monthly_rets)
-regime_df      = reg["regime_df"]
-exp_periods    = reg["expansion_periods"]
-evt_up, evt_down = reg["evt_up"], reg["evt_down"]
+# regime/events
+try:
+    reg = gl.regime_and_events(monthly, monthly_rets)
+    regime_df      = reg["regime_df"]
+    exp_periods    = reg["expansion_periods"]
+    evt_up, evt_down = reg["evt_up"], reg["evt_down"]
+except Exception as e:
+    regime_df = pd.DataFrame()
+    exp_periods, evt_up, evt_down = [], pd.DataFrame(), pd.DataFrame()
+    st.warning(f"คำนวณ Regime/Events ไม่สำเร็จ: {e}")
 
 # ---------------- Title ----------------
 st.title("GLI Dashboard")
 
 # ---------------- KPI row (compact) ----------------
 colA, colB, colC, colD, colE = st.columns(5)
-gli_full   = gl.cagr_from_series(annual["GLI_INDEX"])
-gli_n      = gl.cagr_last_n_years(annual["GLI_INDEX"], years_n)
-gold_full  = gl.cagr_from_series(annual.get("GOLD", pd.Series(dtype=float)))
-nas_full   = gl.cagr_from_series(annual.get("NASDAQ", pd.Series(dtype=float)))
 
-def fmtpct(x): 
-    return "—" if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
+try:
+    gli_full = gl.cagr_from_series(annual["GLI_INDEX"])
+    gli_n    = gl.cagr_last_n_years(annual["GLI_INDEX"], years_n)
+except Exception:
+    gli_full = gli_n = np.nan
 
-colA.metric("GLI CAGR (full)", fmtpct(gli_full))
-colB.metric(f"GLI CAGR ({years_n}y)", fmtpct(gli_n))
-colC.metric("NASDAQ Liquidity-Adj CAGR (full)", 
-            fmtpct(gl.cagr_from_series(annual.get("NASDAQ", pd.Series(dtype=float))) - gli_full if pd.notna(gli_full) else np.nan))
-colD.metric("Gold Liquidity-Adj CAGR (full)", 
-            fmtpct(gl.cagr_from_series(annual.get("GOLD", pd.Series(dtype=float))) - gli_full if pd.notna(gli_full) else np.nan))
-colE.metric("Sharpe (GLI regime mix)", 
-            f"{gl.sharpe(monthly_rets['GLI_INDEX'], rf_annual, 12):.2f}" if "GLI_INDEX" in monthly_rets else "—")
+nas_full  = gl.cagr_from_series(annual.get("NASDAQ", pd.Series(dtype=float))) if isinstance(annual, pd.DataFrame) else np.nan
+gold_full = gl.cagr_from_series(annual.get("GOLD",   pd.Series(dtype=float))) if isinstance(annual, pd.DataFrame) else np.nan
 
-# ---------------- Navigation (in-page tabs) ----------------
+colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
+colB.metric(f"GLI CAGR ({years_n}y)", _fmt_pct(gli_n))
+colC.metric("NASDAQ Liquidity-Adj CAGR (full)",
+            _fmt_pct((gl.cagr_from_series(annual.get("NASDAQ", pd.Series(dtype=float))) - gli_full) if pd.notna(gli_full) else np.nan))
+colD.metric("Gold Liquidity-Adj CAGR (full)",
+            _fmt_pct((gl.cagr_from_series(annual.get("GOLD", pd.Series(dtype=float))) - gli_full) if pd.notna(gli_full) else np.nan))
+colE.metric("Sharpe (GLI regime mix)",
+            f"{gl.sharpe(monthly_rets['GLI_INDEX'], rf_annual, 12):.2f}" if ("GLI_INDEX" in monthly_rets.columns) else "—")
+
+# ---------------- Tabs ----------------
 tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
     ["📈 Rebased + Annual YoY", "📉 Rolling", "🧭 Regime & Events", "📋 Tables"]
 )
@@ -99,10 +144,9 @@ tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
 with tab_main:
     st.subheader("(Monthly) GLI vs NASDAQ / S&P500 / GOLD / BTC / ETH — Rebased = 100")
 
-    # map label(str) -> actual column
-    col_map = {str(c): c for c in rebased_m.columns}
-    labels  = list(col_map.keys())
-
+    # multiselect ใช้ label เป็น string 100%
+    label_map = {str(c): c for c in rebased_m.columns}
+    labels    = list(label_map.keys())
     sel = set(st.multiselect(
         "เลือกเส้นที่ต้องการแสดง",
         options=labels,
@@ -112,16 +156,12 @@ with tab_main:
     ))
 
     fig_rebase = go.Figure()
-    for label, col in col_map.items():
-        fig_rebase.add_trace(
-            go.Scatter(
-                x=rebased_m.index,
-                y=rebased_m[col],
-                mode="lines",
-                name=label,                        # <== ชื่อเป็นสตริงแน่ๆ
-                visible=True if label in sel else "legendonly"
-            )
-        )
+    for label, col in label_map.items():
+        s = rebased_m[col].dropna()
+        fig_rebase.add_trace(go.Scatter(
+            x=s.index, y=s.values, mode="lines",
+            name=label, visible=True if label in sel else "legendonly"
+        ))
     fig_rebase.update_layout(
         title="(Monthly) Rebased=100",
         hovermode="x unified",
@@ -133,21 +173,28 @@ with tab_main:
     st.plotly_chart(fig_rebase, use_container_width=True, config={"displaylogo": False})
 
     st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
-    if annual_yoy_fig is None:
-        ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
-        ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=ann.index, y=ann["GLI_%YoY"],
-                                 mode="lines+markers", name="GLI_%YoY"))
-        for c in [c for c in ann.columns if c != "GLI_%YoY"]:
-            fig.add_trace(go.Bar(x=ann.index, y=ann[c], name=f"{c}_%YoY"))
-        fig.update_layout(title="Annual YoY: GLI (line) vs Assets (bars)",
-                          barmode="group", hovermode="x unified",
-                          legend=dict(orientation="h", y=1.05),
-                          xaxis=dict(rangeslider=dict(visible=True)))
-        annual_yoy_fig = fig
-    st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
 
+    # fallback ถ้า gli_lib ไม่ได้ส่งรูปมา
+    if annual_yoy_fig is None:
+        try:
+            ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
+            ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
+            fig = go.Figure()
+            if "GLI_%YoY" in ann.columns:
+                fig.add_trace(go.Scatter(x=ann.index, y=ann["GLI_%YoY"],
+                                         mode="lines+markers", name="GLI_%YoY"))
+            for c in [c for c in ann.columns if c != "GLI_%YoY"]:
+                fig.add_trace(go.Bar(x=ann.index, y=ann[c], name=f"{c}_%YoY"))
+            fig.update_layout(title="Annual YoY: GLI (line) vs Assets (bars)",
+                              barmode="group", hovermode="x unified",
+                              legend=dict(orientation="h", y=1.05),
+                              xaxis=dict(rangeslider=dict(visible=True)))
+            annual_yoy_fig = fig
+        except Exception as e:
+            st.warning(f"สร้างกราฟ Annual YoY ไม่สำเร็จ: {e}")
+
+    if annual_yoy_fig is not None:
+        st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
 
 # ---------- Tab 2: Rolling ----------
 with tab_roll:
@@ -157,8 +204,10 @@ with tab_roll:
     # Rolling Corr
     with c1:
         fig_rc = go.Figure()
-        for col in [c for c in roll_corr_m_df.columns if c != "GLI_INDEX"]:
-            fig_rc.add_trace(go.Scatter(x=roll_corr_m_df.index, y=roll_corr_m_df[col], mode="lines", name=col))
+        if not roll_corr_m_df.empty:
+            for col in [c for c in roll_corr_m_df.columns if c != "GLI_INDEX"]:
+                s = roll_corr_m_df[col].dropna()
+                fig_rc.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
         fig_rc.update_layout(title=f"Rolling {win_m}M Correlation vs GLI",
                              hovermode="x unified",
                              legend=dict(orientation="h", y=1.02),
@@ -169,8 +218,10 @@ with tab_roll:
     # Rolling Beta
     with c2:
         fig_rb = go.Figure()
-        for col in [c for c in roll_beta_m_df.columns if c != "GLI_INDEX"]:
-            fig_rb.add_trace(go.Scatter(x=roll_beta_m_df.index, y=roll_beta_m_df[col], mode="lines", name=col))
+        if not roll_beta_m_df.empty:
+            for col in [c for c in roll_beta_m_df.columns if c != "GLI_INDEX"]:
+                s = roll_beta_m_df[col].dropna()
+                fig_rb.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
         fig_rb.update_layout(title=f"Rolling {win_m}M Beta vs GLI",
                              hovermode="x unified",
                              legend=dict(orientation="h", y=1.02),
@@ -179,8 +230,10 @@ with tab_roll:
 
     # Rolling Alpha
     fig_ra = go.Figure()
-    for col in [c for c in roll_alpha_m_df.columns if c != "GLI_INDEX"]:
-        fig_ra.add_trace(go.Scatter(x=roll_alpha_m_df.index, y=roll_alpha_m_df[col], mode="lines", name=col))
+    if not roll_alpha_m_df.empty:
+        for col in [c for c in roll_alpha_m_df.columns if c != "GLI_INDEX"]:
+            s = roll_alpha_m_df[col].dropna()
+            fig_ra.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
     fig_ra.update_layout(title=f"Rolling {win_m}M Alpha vs GLI (approx, %/mo)",
                          hovermode="x unified",
                          legend=dict(orientation="h", y=1.02),
@@ -190,11 +243,13 @@ with tab_roll:
 # ---------- Tab 3: Regime & Events ----------
 with tab_regime:
     st.subheader("GLI Regime (YoY>0 = Expansion) & Event Study")
+
     # Rebased + shaded expansion
     fig_reg = go.Figure()
     for col in rebased_m.columns:
-        fig_reg.add_trace(go.Scatter(x=rebased_m.index, y=rebased_m[col], mode="lines", name=col))
-    for s, e in exp_periods:
+        s = rebased_m[col].dropna()
+        fig_reg.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
+    for s, e in (exp_periods or []):
         fig_reg.add_vrect(x0=s, x1=e, fillcolor="LightGreen", opacity=0.18, line_width=0)
     fig_reg.update_layout(title="Rebased (Monthly) + Expansion Shading",
                           hovermode="x unified",
@@ -203,34 +258,45 @@ with tab_regime:
     st.plotly_chart(fig_reg, use_container_width=True, config={"displaylogo": False})
 
     # GLI YoY vs GOLD %/mo (dual axis)
-    fig_gold_yoy = gl.gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods)
-    st.plotly_chart(fig_gold_yoy, use_container_width=True, config={"displaylogo": False})
+    try:
+        fig_gold_yoy = gl.gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods)
+        st.plotly_chart(fig_gold_yoy, use_container_width=True, config={"displaylogo": False})
+    except Exception as e:
+        st.warning(f"สร้างกราฟ GLI YoY vs GOLD ไม่สำเร็จ: {e}")
 
     st.markdown("##### Event Study — ผลตอบแทนสะสมโดยเฉลี่ยหลังจุดเปลี่ยนระบอบ")
     st.caption("**Upturn** = GLI จากหดตัว → ขยายตัว, **Downturn** = GLI จากขยายตัว → หดตัว; วัดผลสะสมถัดไป 3/6/12 เดือน")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**หลัง Upturn**")
-        st.dataframe(evt_up.round(2), use_container_width=True)
+        st.dataframe(evt_up.round(2) if not evt_up.empty else pd.DataFrame(), use_container_width=True)
     with c2:
         st.markdown("**หลัง Downturn**")
-        st.dataframe(evt_down.round(2), use_container_width=True)
+        st.dataframe(evt_down.round(2) if not evt_down.empty else pd.DataFrame(), use_container_width=True)
 
     # Auto summary (Thai)
-    st.markdown("#### 📌 Auto Summary")
-    st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, gl.perf_regime_table(monthly_rets, regime_df)))
+    try:
+        perf_tbl = gl.perf_regime_table(monthly_rets, regime_df)
+        st.markdown("#### 📌 Auto Summary")
+        st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, perf_tbl))
+    except Exception as e:
+        st.warning(f"สรุป Auto Summary ไม่สำเร็จ: {e}")
 
-# ---------- Tab 4: Tables (in compact expanders) ----------
+# ---------- Tab 4: Tables (compact) ----------
 with tab_tables:
     st.subheader("Tables (compact)")
     with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
-        st.dataframe(metrics_table, use_container_width=True, height=340)
+        st.dataframe(metrics_table if isinstance(metrics_table, pd.DataFrame) else pd.DataFrame(),
+                     use_container_width=True, height=340)
     col1, col2 = st.columns(2)
     with col1:
         with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
-            st.dataframe(corr_matrix.round(2), use_container_width=True, height=350)
+            df_show = corr_matrix.round(2) if isinstance(corr_matrix, pd.DataFrame) else pd.DataFrame()
+            st.dataframe(df_show, use_container_width=True, height=350)
     with col2:
         with st.expander("β vs GLI (Monthly OLS)", expanded=False):
-            st.dataframe(betas_df.round(3), use_container_width=True, height=350)
+            df_show = betas_df.round(3) if isinstance(betas_df, pd.DataFrame) else pd.DataFrame()
+            st.dataframe(df_show, use_container_width=True, height=350)
     with st.expander("📈 Monthly closes (preview)", expanded=False):
-        st.dataframe(monthly.tail(12), use_container_width=True, height=320)
+        st.dataframe(monthly.tail(12) if isinstance(monthly, pd.DataFrame) else pd.DataFrame(),
+                     use_container_width=True, height=320)
