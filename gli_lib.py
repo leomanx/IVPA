@@ -171,7 +171,13 @@ def load_all(
 
     assets_yr = assets_df.resample("A-DEC").last()
     gli_yr    = wk["GLI_INDEX"].resample("A-DEC").last().to_frame("GLI_INDEX")
-    annual    = assets_yr.join(gli_yr, how="inner")
+    
+    # บังคับให้เป็น DatetimeIndex แบบ normalized
+    assets_yr.index = pd.to_datetime(assets_yr.index).tz_localize(None).normalize()
+    gli_yr.index    = pd.to_datetime(gli_yr.index).tz_localize(None).normalize()
+    
+    # รวมด้วย concat บน index แล้วทิ้งปีที่ GLI ไม่มีค่า
+    annual = pd.concat([assets_yr, gli_yr], axis=1).dropna(subset=["GLI_INDEX"])
 
     # Metrics
     rows=[]; PER_YEAR_M=12
