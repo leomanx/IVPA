@@ -50,6 +50,38 @@ def safe_df_for_st(df: pd.DataFrame) -> pd.DataFrame:
 def pct(x):
     return "—" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
 
+def find_col(df: pd.DataFrame, *cands) -> str | None:
+    """หาคอลัมน์แบบยืดหยุ่น: ตรงเป๊ะก่อน, ไม่งั้นหาแบบ partial (case-insensitive)"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    cols = [str(c) for c in df.columns]
+
+    # ตรงเป๊ะ (ลำดับผู้สมัครสำคัญสุดก่อน)
+    for k in cands:
+        if k in df.columns:
+            return k
+        if k in cols:
+            # กรณีคอลัมน์เป็น tuple ที่ถูกแปลงเป็นสตริง
+            return cols[cols.index(k)]
+
+    # partial (case-insensitive)
+    low = [c.lower() for c in cols]
+    for k in cands:
+        klow = k.lower()
+        for i, name in enumerate(low):
+            if klow in name:
+                return cols[i]
+    return None
+
+def cagr_from_annual(annual_df: pd.DataFrame, *name_candidates) -> float:
+    """ดึงซีรีส์จาก annual ด้วย find_col แล้วคำนวณ CAGR; หาไม่เจอคืน NaN"""
+    col = find_col(annual_df, *name_candidates)
+    if col is None:
+        return np.nan
+    try:
+        return gl.cagr_from_series(annual_df[col])
+    except Exception:
+        return np.nan
 
 # ---------------- Sidebar ----------------
 st.sidebar.caption("GLI = Fed + ECB + BoJ − TGA − ONRRP (+PBoC optional)")
@@ -110,16 +142,24 @@ st.title("GLI Dashboard")
 
 # ---------------- KPI row ----------------
 colA, colB, colC, colD, colE = st.columns(5)
-gli_full   = gl.cagr_from_series(annual["GLI_INDEX"]) if (isinstance(annual, pd.DataFrame) and "GLI_INDEX" in annual.columns) else np.nan
-gli_n      = gl.cagr_last_n_years(annual["GLI_INDEX"], years_n) if (isinstance(annual, pd.DataFrame) and "GLI_INDEX" in annual.columns) else np.nan
-nas_full   = gl.cagr_from_series(annual["NASDAQ"]) if (isinstance(annual, pd.DataFrame) and "NASDAQ" in annual.columns) else np.nan
-gold_full  = gl.cagr_from_series(annual["GOLD"])   if (isinstance(annual, pd.DataFrame) and "GOLD"   in annual.columns) else np.nan
+
+# GLI
+gli_full = gl.cagr_from_series(annual["GLI_INDEX"]) if (isinstance(annual, pd.DataFrame) and "GLI_INDEX" in annual.columns) else np.nan
+gli_n    = gl.cagr_last_n_years(annual["GLI_INDEX"], years_n) if (isinstance(annual, pd.DataFrame) and "GLI_INDEX" in annual.columns) else np.nan
+
+# NASDAQ / GOLD — ใช้ชื่อสำรองหลายแบบ เผื่อคอลัมน์เป็น tuple หรือชื่อยาว
+nas_full  = cagr_from_annual(annual, "NASDAQ", "^IXIC", "NASDAQCOM")
+gold_full = cagr_from_annual(annual, "GOLD", "GC=F", "GLD")
 
 colA.metric("GLI CAGR (full)", pct(gli_full))
 colB.metric(f"GLI CAGR ({years_n}y)", pct(gli_n))
-colC.metric("NASDAQ − GLI (CAGR)", pct(nas_full - gli_full) if np.isfinite(nas_full) and np.isfinite(gli_full) else "—")
-colD.metric("GOLD − GLI (CAGR)",   pct(gold_full - gli_full) if np.isfinite(gold_full) and np.isfinite(gli_full) else "—")
-colE.metric("Sharpe(GLI monthly)", f"{gl.sharpe(monthly_rets['GLI_INDEX'], rf_annual, 12):.2f}" if (isinstance(monthly_rets, pd.DataFrame) and "GLI_INDEX" in monthly_rets.columns) else "—")
+colC.metric("NASDAQ − GLI (CAGR)",
+            pct(nas_full - gli_full) if np.isfinite(nas_full) and np.isfinite(gli_full) else "—")
+colD.metric("GOLD − GLI (CAGR)",
+            pct(gold_full - gli_full) if np.isfinite(gold_full) and np.isfinite(gli_full) else "—")
+colE.metric("Sharpe(GLI monthly)",
+            f"{gl.sharpe(monthly_rets['GLI_INDEX'], rf_annual, 12):.2f}"
+            if (isinstance(monthly_rets, pd.DataFrame) and "GLI_INDEX" in monthly_rets.columns) else "—")
 
 # ---------------- Tabs ----------------
 tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
