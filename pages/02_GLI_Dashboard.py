@@ -34,6 +34,7 @@ PRETTY = {
     "BTC":"BTC",
     "ETH":"ETH",
 }
+
 def rename_pretty_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [PRETTY.get(c, c) for c in out.columns]
@@ -41,7 +42,6 @@ def rename_pretty_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def safe_df_for_st(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # ถ้ามีคอลัมน์ object เป็น tuple/list -> แปลงเป็น string
     for c in out.columns:
         if out[c].dtype == "object":
             out[c] = out[c].apply(lambda v: ", ".join(map(str, v)) if isinstance(v, (tuple, list)) else v)
@@ -236,33 +236,48 @@ with tab_roll:
     st.plotly_chart(fig_ra, use_container_width=True, config={"displaylogo": False})
 
 # ===== Tab 3: Regime & Events =====
+# ---------- Tab 3: Regime & Events ----------
 with tab_regime:
-    st.subheader("GLI Regime (YoY>0 = Expansion) + Events")
-    # Rebased + shading (ใช้ UI labels)
+    st.subheader("GLI Regime (YoY>0 = Expansion) & Event Study")
+
+    # Rebased + shaded expansion
     fig_reg = go.Figure()
     for col in rebased_m.columns:
         fig_reg.add_trace(go.Scatter(x=rebased_m.index, y=rebased_m[col], mode="lines", name=col))
     for s, e in exp_periods:
         fig_reg.add_vrect(x0=s, x1=e, fillcolor="LightGreen", opacity=0.18, line_width=0)
-    fig_reg.update_layout(hovermode="x unified", legend=dict(orientation="h", y=1.02),
+    fig_reg.update_layout(title="Rebased (Monthly) + Expansion Shading",
+                          hovermode="x unified",
+                          legend=dict(orientation="h", y=1.02),
                           xaxis=dict(rangeslider=dict(visible=True)))
     st.plotly_chart(fig_reg, use_container_width=True, config={"displaylogo": False})
 
+    # GLI YoY vs GOLD %/mo (dual axis)
     fig_gold_yoy = gl.gli_yoy_vs_gold(raw_monthly, raw_monthly_rets, regime_df, exp_periods)
     st.plotly_chart(fig_gold_yoy, use_container_width=True, config={"displaylogo": False})
 
-    st.markdown("##### Event Study — ผลตอบแทนสะสมเฉลี่ยหลังจุดเปลี่ยนระบอบ")
-    st.caption("**Upturn** = GLI จากหดตัว→ขยายตัว, **Downturn** = GLI จากขยายตัว→หดตัว (คำนวณผลสะสมถัดไป 3/6/12 เดือน)")
+    st.markdown("##### Event Study — ผลตอบแทนสะสมโดยเฉลี่ยหลังจุดเปลี่ยนระบอบ")
+    st.caption("**Upturn** = GLI จากหดตัว → ขยายตัว, **Downturn** = GLI จากขยายตัว → หดตัว; วัดผลสะสมถัดไป 3/6/12 เดือน")
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**หลัง Upturn**")
-        st.dataframe(evt_up.round(2), use_container_width=True)
+        st.dataframe(
+            safe_df_for_st(evt_up.round(2)).reset_index().rename(columns={'index': 'Asset'}),
+            use_container_width=True
+        )
     with c2:
         st.markdown("**หลัง Downturn**")
-        st.dataframe(evt_down.round(2), use_container_width=True)
+        st.dataframe(
+            safe_df_for_st(evt_down.round(2)).reset_index().rename(columns={'index': 'Asset'}),
+            use_container_width=True
+        )
 
+    # Auto summary (Thai)
     st.markdown("#### 📌 Auto Summary")
-    st.info(gl.auto_summary(metrics_table_raw, betas_df_raw, evt_up, evt_down, gl.perf_regime_table(raw_monthly_rets, regime_df)))
+    st.info(gl.auto_summary(metrics_table_raw, betas_df_raw, evt_up, evt_down,
+                            gl.perf_regime_table(raw_monthly_rets, regime_df)))
+
 
 # ===== Tab 4: Tables =====
 with tab_tables:
