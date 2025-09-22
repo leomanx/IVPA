@@ -183,93 +183,74 @@ evt_up, evt_down = reg["evt_up"], reg["evt_down"]
 # ------------- Title -------------
 st.title("GLI Dashboard")
 
-# ---------------- KPI row (compact) ----------------
+# ------------- KPI row (แก้ไขส่วนนี้) -------------
 colA, colB, colC, colD, colE = st.columns(5)
 
-def _years_span(idx):
-    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
-        return np.nan
-    return (idx[-1] - idx[0]).days / 365.25
+# ซีรีส์ annual โดยเน้น GLI/NASDAQ/GOLD (ถ้า annual ไม่มี ให้ fallback จาก monthly)
+gli_ser_a  = _pick_series(annual, "GLI_INDEX")
+nas_ser_a  = _pick_series(annual, "NASDAQ")
+gold_ser_a = _pick_series(annual, "GOLD")
 
-def _cagr_from_series_any(s: pd.Series) -> float:
-    """CAGR จาก series ใด ๆ (index ต้องเป็น datetime และค่าต้อง > 0 อย่างน้อยสองจุด)"""
+if gli_ser_a.empty:
+    gli_ser_a  = _annual_series_from_monthly(monthly, "GLI_INDEX")
+if nas_ser_a.empty:
+    nas_ser_a  = _annual_series_from_monthly(monthly, "NASDAQ")
+if gold_ser_a.empty:
+    gold_ser_a = _annual_series_from_monthly(monthly, "GOLD")
+
+# คำนวณ CAGR
+gli_full = gl.cagr_from_series(gli_ser_a)
+gli_n    = gl.cagr_last_n_years(gli_ser_a, int(years_n))
+nas_full = gl.cagr_from_series(nas_ser_a)
+gold_full= gl.cagr_from_series(gold_ser_a)
+
+# Debug info (แสดงค่าใน sidebar เพื่อตรวจสอบ)
+with st.sidebar:
+    st.write("Debug Info:")
+    st.write(f"GLI CAGR: {gli_full}")
+    st.write(f"NASDAQ CAGR: {nas_full}")
+    st.write(f"GOLD CAGR: {gold_full}")
+    st.write(f"GLI series length: {len(gli_ser_a)}")
+    st.write(f"GOLD series length: {len(gold_ser_a)}")
+
+# แสดง KPIs
+colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
+colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
+
+# คำนวณ liquidity premium แบบปลอดภัยมากขึ้น
+nas_liq = np.nan
+gold_liq = np.nan
+
+if pd.notna(nas_full) and pd.notna(gli_full) and gli_full is not None and nas_full is not None:
     try:
-        s = pd.Series(s).dropna().astype(float)
-        if s.size < 2: 
-            return np.nan
-        # ถ้าเป็นรีเบส 100 ก็โอเค ใช้ได้เหมือนกัน
-        yrs = _years_span(pd.to_datetime(s.index))
-        if not np.isfinite(yrs) or yrs <= 0: 
-            return np.nan
-        start_val, end_val = float(s.iloc[0]), float(s.iloc[-1])
-        if start_val <= 0 or end_val <= 0: 
-            return np.nan
-        return (end_val / start_val) ** (1.0 / yrs) - 1.0
-    except Exception:
-        return np.nan
+        nas_liq = float(nas_full) - float(gli_full)
+    except (TypeError, ValueError):
+        nas_liq = np.nan
 
-def _pick_monthly_series(logical_name: str) -> pd.Series:
-    """หา series จาก monthly ตาม logical name (GLI_INDEX/NASDAQ/GOLD)"""
-    col = _col_of(monthly, logical_name) if isinstance(monthly, pd.DataFrame) else None
-    return monthly[col] if (col and col in getattr(monthly, "columns", [])) else pd.Series(dtype=float, name=logical_name)
+if pd.notna(gold_full) and pd.notna(gli_full) and gli_full is not None and gold_full is not None:
+    try:
+        gold_liq = float(gold_full) - float(gli_full)
+    except (TypeError, ValueError):
+        gold_liq = np.nan
 
-def _pick_annual_series(logical_name: str) -> pd.Series:
-    """หา series จาก annual ถ้าไม่มีจะสร้างจาก monthly (A-DEC last)"""
-    col = _col_of(annual, logical_name) if isinstance(annual, pd.DataFrame) else None
-    if col and col in getattr(annual, "columns", []):
-        return annual[col]
-    # สร้างจาก monthly
-    m = _pick_monthly_series(logical_name)
-    if m.empty:
-        return pd.Series(dtype=float, name=logical_name)
-    return m.resample("A-DEC").last()
-
-def _cagr_from_any(logical_name: str) -> float:
-    """พยายามคำนวณ CAGR จาก annual -> monthly(A-DEC) -> rebased_m (fallback สุดท้าย)"""
-    # 1) annual (หรือสร้างจาก monthly แล้ว)
-    s_ann = _pick_annual_series(logical_name)
-    c = _cagr_from_series_any(s_ann)
-    if pd.notna(c):
-        return c
-    # 2) monthly (โดยตรง ถ้าผู้ใช้เริ่มต้นกลางปี)
-    s_m = _pick_monthly_series(logical_name)
-    c = _cagr_from_series_any(s_m)
-    if pd.notna(c):
-        return c
-    # 3) rebased_m (รีเบส = 100)
-    if isinstance(rebased_m, pd.DataFrame):
-        # map logical_name -> column ใน rebased_m
-        map_rm = {"GLI_INDEX": "GLI", "NASDAQ": "NASDAQ", "GOLD": "GOLD"}
-        rm_col = map_rm.get(logical_name, logical_name)
-        if rm_col in rebased_m.columns:
-            c = _cagr_from_series_any(rebased_m[rm_col])
-            if pd.notna(c):
-                return c
-    return np.nan
-
-# คำนวณ GLI/NASDAQ/GOLD CAGR ด้วย fallback
-gli_full = _cagr_from_any("GLI_INDEX")
-gli_n    = gl.cagr_last_n_years(_pick_annual_series("GLI_INDEX"), int(years_n))
-if pd.isna(gli_n):
-    # ถ้า annual ช่วง N ปีไม่พอ ลองคำนวณจาก monthly ตรง ๆ
-    gli_n = gl.cagr_last_n_years(_pick_monthly_series("GLI_INDEX").resample("A-DEC").last(), int(years_n))
-
-nas_full  = _cagr_from_any("NASDAQ")
-gold_full = _cagr_from_any("GOLD")
-
-# แสดง KPI
-colA.metric("GLI (CAGR, full)", _fmt_pct(gli_full))
-colB.metric(f"GLI (CAGR, {int(years_n)}y)", _fmt_pct(gli_n))
-
-nas_liq  = (nas_full - gli_full)  if (pd.notna(nas_full)  and pd.notna(gli_full))  else np.nan
-gold_liq = (gold_full - gli_full) if (pd.notna(gold_full) and pd.notna(gli_full)) else np.nan
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
 colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
 
-shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) \
-          if (isinstance(monthly_rets, pd.DataFrame) and "GLI_INDEX" in monthly_rets.columns) else np.nan
+# Sharpe ratio
+shp_gli = np.nan
+try:
+    gli_col = _col_of(monthly_rets, "GLI_INDEX")
+    if gli_col and isinstance(monthly_rets, pd.DataFrame) and gli_col in monthly_rets.columns:
+        shp_gli = gl.sharpe(monthly_rets[gli_col], float(rf_annual), 12)
+except Exception:
+    shp_gli = np.nan
+
 colE.metric("Sharpe (GLI)", f"{shp_gli:.2f}" if pd.notna(shp_gli) else "—")
 
+# ------------- Tabs -------------
+tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
+    ["📈 Rebased + Annual YoY", "📉 Rolling", "🧭 Regime & Events", "📋 Tables"]
+)
 
 # ---------- Tab 1: Rebased + Annual YoY ----------
 with tab_main:
