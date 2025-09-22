@@ -198,11 +198,50 @@ if nas_ser_a.empty:
 if gold_ser_a.empty:
     gold_ser_a = _annual_series_from_monthly(monthly, "GOLD")
 
+# ฟังก์ชันสำรอง CAGR calculation
+def _calc_cagr_safe(series: pd.Series) -> float:
+    """คำนวณ CAGR แบบปลอดภัย fallback ถ้า gl.cagr_from_series() ไม่ทำงาน"""
+    if series.empty or len(series) < 2:
+        return np.nan
+    try:
+        # ลองใช้ฟังก์ชันจาก library ก่อน
+        result = gl.cagr_from_series(series)
+        if pd.notna(result) and result is not None:
+            return float(result)
+    except:
+        pass
+    
+    # Fallback: คำนวณเอง
+    try:
+        series_clean = series.dropna()
+        if len(series_clean) < 2:
+            return np.nan
+        start_val = series_clean.iloc[0]
+        end_val = series_clean.iloc[-1]
+        if start_val <= 0 or end_val <= 0:
+            return np.nan
+        years = len(series_clean) / 12.0  # สมมติเป็นข้อมูลรายเดือน
+        if years <= 0:
+            return np.nan
+        cagr = (end_val / start_val) ** (1/years) - 1
+        return cagr
+    except:
+        return np.nan
+
 # คำนวณ CAGR
-gli_full = gl.cagr_from_series(gli_ser_a)
-gli_n    = gl.cagr_last_n_years(gli_ser_a, int(years_n))
-nas_full = gl.cagr_from_series(nas_ser_a)
-gold_full= gl.cagr_from_series(gold_ser_a)
+gli_full = _calc_cagr_safe(gli_ser_a)
+nas_full = _calc_cagr_safe(nas_ser_a)
+gold_full = _calc_cagr_safe(gold_ser_a)
+
+# สำหรับ GLI N years - ลองใช้ library function ก่อน
+try:
+    gli_n = gl.cagr_last_n_years(gli_ser_a, int(years_n))
+    if gli_n is None or pd.isna(gli_n):
+        # Fallback: หา N years ล่าสุด
+        gli_n_years = gli_ser_a.tail(int(years_n) * 12) if len(gli_ser_a) >= int(years_n) * 12 else gli_ser_a
+        gli_n = _calc_cagr_safe(gli_n_years)
+except:
+    gli_n = np.nan
 
 # Debug info (แสดงค่าใน sidebar เพื่อตรวจสอบ)
 with st.sidebar:
@@ -211,27 +250,28 @@ with st.sidebar:
     st.write(f"NASDAQ CAGR: {nas_full}")
     st.write(f"GOLD CAGR: {gold_full}")
     st.write(f"GLI series length: {len(gli_ser_a)}")
+    st.write(f"NASDAQ series length: {len(nas_ser_a)}")
     st.write(f"GOLD series length: {len(gold_ser_a)}")
+    
+    # แสดงคอลัมน์ที่พบ
+    st.write("Found columns:")
+    st.write(f"GLI: {_col_of(monthly, 'GLI_INDEX')}")
+    st.write(f"NASDAQ: {_col_of(monthly, 'NASDAQ')}")
+    st.write(f"GOLD: {_col_of(monthly, 'GOLD')}")
 
 # แสดง KPIs
 colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
 colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
 
-# คำนวณ liquidity premium แบบปลอดภัยมากขึ้น
+# คำนวณ liquidity premium
 nas_liq = np.nan
 gold_liq = np.nan
 
-if pd.notna(nas_full) and pd.notna(gli_full) and gli_full is not None and nas_full is not None:
-    try:
-        nas_liq = float(nas_full) - float(gli_full)
-    except (TypeError, ValueError):
-        nas_liq = np.nan
+if pd.notna(nas_full) and pd.notna(gli_full):
+    nas_liq = nas_full - gli_full
 
-if pd.notna(gold_full) and pd.notna(gli_full) and gli_full is not None and gold_full is not None:
-    try:
-        gold_liq = float(gold_full) - float(gli_full)
-    except (TypeError, ValueError):
-        gold_liq = np.nan
+if pd.notna(gold_full) and pd.notna(gli_full):
+    gold_liq = gold_full - gli_full
 
 colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
 colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
@@ -384,12 +424,66 @@ with tab_regime:
         st.markdown("**หลัง Downturn**")
         st.dataframe(_to_display_df(evt_down.round(2) if isinstance(evt_down, pd.DataFrame) else evt_down), use_container_width=True)
 
-    # Auto summary (Thai)
+    # Auto summary (Thai) - แก้ไขให้ปลอดภัยขึ้น
     st.markdown("#### 📌 Auto Summary")
     try:
-        st.info(gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, gl.perf_regime_table(monthly_rets, regime_df)))
-    except Exception:
-        st.info("สรุปย่อ: (ไม่สามารถคำนวณได้จากข้อมูลที่มี)")
+        # สร้าง performance regime table แบบปลอดภัย
+        perf_regime = None
+        try:
+            perf_regime = gl.perf_regime_table(monthly_rets, regime_df)
+        except:
+            pass
+            
+        # เรียก auto_summary แบบปลอดภัย
+        summary_text = gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, perf_regime)
+        
+        # ถ้าได้ summary กลับมา
+        if summary_text and isinstance(summary_text, str) and len(summary_text.strip()) > 0:
+            st.info(summary_text)
+        else:
+            # สร้าง summary เอง
+            custom_summary = []
+            
+            # GLI CAGR info
+            if pd.notna(gli_full):
+                custom_summary.append(f"• GLI CAGR (เต็มช่วง): {_fmt_pct(gli_full)}")
+            if pd.notna(gli_n):
+                custom_summary.append(f"• GLI CAGR ({int(years_n)} ปี): {_fmt_pct(gli_n)}")
+                
+            # Liquidity premium
+            if pd.notna(nas_liq):
+                custom_summary.append(f"• NASDAQ เหนือ GLI: {_fmt_pct(nas_liq)}")
+            if pd.notna(gold_liq):
+                custom_summary.append(f"• GOLD เหนือ GLI: {_fmt_pct(gold_liq)}")
+                
+            # Beta info from betas_df
+            if isinstance(betas_df, pd.DataFrame) and not betas_df.empty:
+                try:
+                    # หา asset ที่มี beta สูงสุด/ต่ำสุด
+                    beta_col = None
+                    for col in ['beta', 'Beta', 'BETA']:
+                        if col in betas_df.columns:
+                            beta_col = col
+                            break
+                    
+                    if beta_col:
+                        betas_clean = betas_df[beta_col].dropna()
+                        if not betas_clean.empty:
+                            max_beta_idx = betas_clean.idxmax()
+                            min_beta_idx = betas_clean.idxmin()
+                            custom_summary.append(f"• Beta สูงสุด: {max_beta_idx} ({betas_clean[max_beta_idx]:.2f})")
+                            custom_summary.append(f"• Beta ต่ำสุด: {min_beta_idx} ({betas_clean[min_beta_idx]:.2f})")
+                except:
+                    pass
+                    
+            if custom_summary:
+                st.info("สรุปหลักๆ:\n" + "\n".join(custom_summary))
+            else:
+                st.info("สรุปย่อ: ไม่สามารถสร้างสรุปได้จากข้อมูลปัจจุบัน")
+                
+    except Exception as e:
+        st.warning(f"ไม่สามารถสร้าง Auto Summary ได้: {str(e)}")
+        st.info("กรุณาตรวจสอบข้อมูลในแท็บ Tables เพื่อดูรายละเอียด")
 
 # ---------- Tab 4: Tables ----------
 with tab_tables:
