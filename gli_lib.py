@@ -329,25 +329,80 @@ def gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods):
     return fig
 
 def auto_summary(metrics_table, betas_df, evt_up, evt_down, perf_regime_tbl):
-    lines=[]
+    """สรุปย่อรายเดือนแบบอ่านง่าย พร้อมทำความสะอาดชื่อสินทรัพย์"""
+    def _pretty_name(x: object) -> str:
+        s = str(x)
+        # ตัดเศษซ้อน เช่น tuple/list แอบถูก cast เป็นสตริง
+        s = s.strip().strip("()[]")
+        # ตัดเศษคอมมา/ช่องว่างปลายหาง
+        s = s.replace("'", "").replace('"', "").strip()
+        # map ชื่อยอดฮิตให้เป็นมาตรฐาน
+        aliases = {
+            "^GSPC": "SP500",
+            "^IXIC": "NASDAQ",
+            "GC=F": "GOLD",
+            "GLD": "GOLD",
+            "BTC-USD": "BTC",
+            "ETH-USD": "ETH",
+        }
+        if s in aliases: 
+            return aliases[s]
+        # ตัด suffix ตลาดสกุลเงินยอดนิยม
+        for suf in ("-USD", "-USDT", "-THB"):
+            if s.endswith(suf):
+                return s.replace(suf, "")
+        return s
+
+    lines = []
     lines.append("สรุปย่อ (วัดเป็นรายเดือน):")
+
+    # ===== อดีต: Liquidity-Adj CAGR =====
     try:
-        liq_cols=[c for c in metrics_table.columns if "LiquidityAdj_CAGR" in c]
-        liq_mean=metrics_table.set_index("Asset")[liq_cols].mean(axis=1).sort_values(ascending=False)
-        past_top=", ".join(liq_mean.head(2).index.tolist()); past_bot=", ".join(liq_mean.tail(1).index.tolist())
+        liq_cols = [c for c in metrics_table.columns if "LiquidityAdj_CAGR" in c]
+        liq = metrics_table.set_index("Asset")[liq_cols].dropna(how="all")
+        # เฉลี่ยข้ามคอลัมน์ LiquidityAdj_CAGR_* แล้วจัดอันดับ
+        liq_mean = liq.mean(axis=1).dropna()
+        if liq_mean.empty:
+            raise ValueError("empty liq_mean")
+        liq_mean = liq_mean.sort_values(ascending=False)
+        past_top = ", ".join(_pretty_name(n) for n in liq_mean.head(2).index.tolist())
+        past_bot = ", ".join(_pretty_name(n) for n in liq_mean.tail(1).index.tolist())
         lines.append(f"- อดีต: เมื่อเทียบกับ GLI ระยะยาว เด่นสุด: {past_top}; อ่อนสุด: {past_bot}")
     except Exception:
         lines.append("- อดีต: (สรุป Liquidity-Adj CAGR ไม่สำเร็จ)")
+
+    # ===== ปัจจุบัน: Beta vs GLI =====
     try:
-        latest_beta = betas_df["Beta_vs_GLI"].sort_values(ascending=False)
-        lines.append(f"- ปัจจุบัน: Beta ต่อ GLI สูงสุด: {latest_beta.index[0]} | ต่ำสุด: {latest_beta.index[-1]}")
+        beta_ser = betas_df["Beta_vs_GLI"].dropna()
+        if beta_ser.empty:
+            raise ValueError("empty beta")
+        beta_ser = beta_ser.sort_values(ascending=False)
+        beta_hi = _pretty_name(beta_ser.index[0])
+        beta_lo = _pretty_name(beta_ser.index[-1])
+        lines.append(f"- ปัจจุบัน: Beta ต่อ GLI สูงสุด: {beta_hi} | ต่ำสุด: {beta_lo}")
     except Exception:
         lines.append("- ปัจจุบัน: (ข้อมูลเบต้าไม่ครบ)")
+
+    # ===== อนาคต: ชนะในแต่ละระบอบ (Expansion / Contraction) =====
     try:
-        avg = perf_regime_tbl["Avg_%/mo"]
-        exp_winners = avg.loc[True].sort_values(ascending=False).head(2).index.tolist()
-        con_winners = avg.loc[False].sort_values(ascending=False).head(2).index.tolist()
-        lines.append(f"- อนาคต (ตามสถานการณ์): หาก GLI ขยาย → เน้น {', '.join(exp_winners)}; ถ้า GLI หด → เน้น {', '.join(con_winners)}")
+        # perf_regime_tbl มี MultiIndex คอลัมน์: ('Avg_%/mo', Asset)
+        avg = perf_regime_tbl["Avg_%/mo"].copy()
+        # กัน GLI_INDEX ออก
+        if "GLI_INDEX" in avg.columns:
+            avg = avg.drop(columns=["GLI_INDEX"])
+        # เลือกแถวตาม regime
+        exp_row = avg.loc[True].dropna()
+        con_row = avg.loc[False].dropna()
+        # จัดอันดับจากมากไปน้อย
+        exp_winners = [ _pretty_name(x) for x in exp_row.sort_values(ascending=False).head(2).index.tolist() ]
+        con_winners = [ _pretty_name(x) for x in con_row.sort_values(ascending=False).head(2).index.tolist() ]
+        if len(exp_winners)==0 and len(con_winners)==0:
+            raise ValueError("no winners")
+        exp_txt = ", ".join(exp_winners) if exp_winners else "—"
+        con_txt = ", ".join(con_winners) if con_winners else "—"
+        lines.append(f"- อนาคต (ตามสถานการณ์): หาก GLI ขยาย → เน้น {exp_txt}; ถ้า GLI หด → เน้น {con_txt}")
     except Exception:
         lines.append("- อนาคต: (สรุป regime ไม่สำเร็จ)")
+
     return "\n".join(lines)
+
