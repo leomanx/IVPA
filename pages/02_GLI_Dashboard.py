@@ -1,5 +1,6 @@
 # pages/02_GLI_Dashboard.py
-import os, math
+import os
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,14 +10,16 @@ import gli_lib as gl
 
 st.set_page_config(page_title="GLI Dashboard", layout="wide")
 
-# ---------------- Helpers (safe/flatten) ----------------
+# ---------------- Helpers ----------------
 def _flatten_cols(obj):
-    """Return object with string/flat columns. Safe for None/Series/DataFrame."""
+    """Flatten MultiIndex cols -> strings; accept None/Series/DataFrame safely."""
     if obj is None:
         return None
     if isinstance(obj, pd.Series):
         name = str(obj.name) if obj.name is not None else "value"
-        return obj.to_frame(name)
+        df = obj.to_frame(name)
+        df.columns = [str(c) for c in df.columns]
+        return df
     if isinstance(obj, pd.DataFrame):
         df = obj.copy()
         if isinstance(df.columns, pd.MultiIndex):
@@ -24,46 +27,37 @@ def _flatten_cols(obj):
         else:
             df.columns = [str(c) for c in df.columns]
         return df
-    return obj  # other types untouched
+    return obj
 
 def _sanitize_for_st(df: pd.DataFrame) -> pd.DataFrame:
-    """ทำความสะอาด df เพื่อให้ st.dataframe แปลงเป็น Arrow ได้ไม่พัง"""
+    """Clean DataFrame to be Arrow-friendly for st.dataframe."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
-
     d = df.copy()
-
-    # เปลี่ยน inf เป็น NaN ก่อน
     d = d.replace([np.inf, -np.inf], np.nan)
-
-    # บังคับชื่อคอลัมน์และ index เป็นสตริง
     d.columns = [str(c) for c in d.columns]
     try:
         d.index = d.index.map(str)
     except Exception:
         pass
-
-    # แปลงคอลัมน์ object → numeric ถ้าได้; ไม่ได้ให้เป็น string
     for c in d.columns:
         s = d[c]
-        if pd.api.types.is_object_dtype(s) or getattr(s, "dtype", None) == "Sparse[int]":
+        if pd.api.types.is_object_dtype(s) or str(getattr(s, "dtype", "")).startswith("Sparse"):
             try:
                 s_num = pd.to_numeric(s, errors="coerce")
-                # ถ้าแปลงเป็นตัวเลขได้ ≥ 50% ให้ใช้ numeric; ไม่งั้นใช้ string
                 if s_num.notna().mean() >= 0.5:
                     d[c] = s_num
                 else:
                     d[c] = s.astype(str)
             except Exception:
                 d[c] = s.astype(str)
-
     return d
 
 def _fmt_pct(x):
     return "—" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.2f}%"
 
 # ---------------- Sidebar ----------------
-st.sidebar.caption("GLI: Fed+ECB+BoJ − TGA − ONRRP (+PBoC optional)")
+st.sidebar.caption("GLI: Fed + ECB + BoJ − TGA − ONRRP (+PBoC optional)")
 start     = st.sidebar.text_input("Start (YYYY-MM-DD)", "2008-01-01")
 years_n   = st.sidebar.number_input("CAGR lookback (years)", 5, 25, 10, step=1)
 rf_annual = st.sidebar.number_input("Risk-free (annual)", 0.00, 0.10, 0.02, step=0.0025, format="%.4f")
@@ -85,7 +79,6 @@ with st.spinner("Loading GLI & assets..."):
         pboc_series_id=None
     )
 
-# unpack
 wk              = data.get("wk")
 monthly         = data.get("monthly")
 monthly_rets    = data.get("monthly_rets")
@@ -101,26 +94,20 @@ monthly       = _flatten_cols(monthly)
 monthly_rets  = _flatten_cols(monthly_rets)
 annual        = _flatten_cols(annual)
 rebased_m     = _flatten_cols(rebased_m)
-if isinstance(corr_matrix, pd.DataFrame):
-    corr_matrix = _flatten_cols(corr_matrix)
+if isinstance(corr_matrix, pd.DataFrame): corr_matrix = _flatten_cols(corr_matrix)
 if isinstance(betas_df, pd.DataFrame):
-    try:
-        betas_df.index = betas_df.index.map(str)
-    except Exception:
-        pass
+    betas_df = _flatten_cols(betas_df)
+    try: betas_df.index = betas_df.index.map(str)
+    except Exception: pass
 
-# defensive guards
+# guards
 if monthly is None or monthly.empty:
     st.error("ไม่พบข้อมูลรายเดือน (monthly) — ตรวจ API/เน็ต แล้วลอง Refresh cache")
     st.stop()
 if rebased_m is None or rebased_m.empty:
-    # สร้างจาก monthly หากไม่มี
-    try:
-        cols = [c for c in monthly.columns if c]  # all
-        rebased_m = pd.DataFrame({ c: (monthly[c]/monthly[c].dropna().iloc[0])*100.0 for c in cols if monthly[c].dropna().size })
-    except Exception:
-        st.error("สร้าง rebased panel ไม่สำเร็จ")
-        st.stop()
+    # สร้าง rebased จาก monthly ถ้าไม่ถูกส่งมา
+    cols = [c for c in monthly.columns if monthly[c].dropna().size]
+    rebased_m = pd.DataFrame({c: (monthly[c]/monthly[c].dropna().iloc[0])*100.0 for c in cols})
 
 # rolling stats
 try:
@@ -130,8 +117,8 @@ try:
     roll_beta_m_df  = _flatten_cols(roll_beta_m_df)
     roll_alpha_m_df = _flatten_cols(roll_alpha_m_df)
 except Exception as e:
-    roll_corr_m_df = roll_beta_m_df = roll_alpha_m_df = pd.DataFrame()
     st.warning(f"คำนวณ rolling ไม่สำเร็จ: {e}")
+    roll_corr_m_df = roll_beta_m_df = roll_alpha_m_df = pd.DataFrame()
 
 # regime/events
 try:
@@ -140,16 +127,15 @@ try:
     exp_periods    = reg["expansion_periods"]
     evt_up, evt_down = reg["evt_up"], reg["evt_down"]
 except Exception as e:
+    st.warning(f"คำนวณ Regime/Events ไม่สำเร็จ: {e}")
     regime_df = pd.DataFrame()
     exp_periods, evt_up, evt_down = [], pd.DataFrame(), pd.DataFrame()
-    st.warning(f"คำนวณ Regime/Events ไม่สำเร็จ: {e}")
 
 # ---------------- Title ----------------
 st.title("GLI Dashboard")
 
-# ---------------- KPI row (compact) ----------------
+# ---------------- KPI row ----------------
 colA, colB, colC, colD, colE = st.columns(5)
-
 try:
     gli_full = gl.cagr_from_series(annual["GLI_INDEX"])
     gli_n    = gl.cagr_last_n_years(annual["GLI_INDEX"], years_n)
@@ -177,7 +163,7 @@ tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
 with tab_main:
     st.subheader("(Monthly) GLI vs NASDAQ / S&P500 / GOLD / BTC / ETH — Rebased = 100")
 
-    # multiselect ใช้ label เป็น string 100%
+    # multiselect เป็น label string เสมอ
     label_map = {str(c): c for c in rebased_m.columns}
     labels    = list(label_map.keys())
     sel = set(st.multiselect(
@@ -206,8 +192,7 @@ with tab_main:
     st.plotly_chart(fig_rebase, use_container_width=True, config={"displaylogo": False})
 
     st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
-
-    # fallback ถ้า gli_lib ไม่ได้ส่งรูปมา
+    # fallback ถ้า gli_lib ไม่ส่งรูปมา
     if annual_yoy_fig is None:
         try:
             ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
@@ -237,7 +222,7 @@ with tab_roll:
     # Rolling Corr
     with c1:
         fig_rc = go.Figure()
-        if not roll_corr_m_df.empty:
+        if isinstance(roll_corr_m_df, pd.DataFrame) and not roll_corr_m_df.empty:
             for col in [c for c in roll_corr_m_df.columns if c != "GLI_INDEX"]:
                 s = roll_corr_m_df[col].dropna()
                 fig_rc.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
@@ -251,7 +236,7 @@ with tab_roll:
     # Rolling Beta
     with c2:
         fig_rb = go.Figure()
-        if not roll_beta_m_df.empty:
+        if isinstance(roll_beta_m_df, pd.DataFrame) and not roll_beta_m_df.empty:
             for col in [c for c in roll_beta_m_df.columns if c != "GLI_INDEX"]:
                 s = roll_beta_m_df[col].dropna()
                 fig_rb.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
@@ -263,7 +248,7 @@ with tab_roll:
 
     # Rolling Alpha
     fig_ra = go.Figure()
-    if not roll_alpha_m_df.empty:
+    if isinstance(roll_alpha_m_df, pd.DataFrame) and not roll_alpha_m_df.empty:
         for col in [c for c in roll_alpha_m_df.columns if c != "GLI_INDEX"]:
             s = roll_alpha_m_df[col].dropna()
             fig_ra.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=str(col)))
@@ -302,10 +287,12 @@ with tab_regime:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**หลัง Upturn**")
-        st.dataframe(evt_up.round(2) if not evt_up.empty else pd.DataFrame(), use_container_width=True)
+        st.dataframe(_sanitize_for_st(evt_up.round(2) if isinstance(evt_up, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True)
     with c2:
         st.markdown("**หลัง Downturn**")
-        st.dataframe(evt_down.round(2) if not evt_down.empty else pd.DataFrame(), use_container_width=True)
+        st.dataframe(_sanitize_for_st(evt_down.round(2) if isinstance(evt_down, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True)
 
     # Auto summary (Thai)
     try:
@@ -319,18 +306,19 @@ with tab_regime:
 with tab_tables:
     st.subheader("Tables (compact)")
     with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
-    st.dataframe(_sanitize_for_st(metrics_table), use_container_width=True, height=340)
+        st.dataframe(_sanitize_for_st(metrics_table if isinstance(metrics_table, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True, height=340)
 
-with col1:
-    with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
-        st.dataframe(_sanitize_for_st(corr_matrix.round(2) if isinstance(corr_matrix, pd.DataFrame) else pd.DataFrame()),
-                     use_container_width=True, height=350)
+    col1, col2 = st.columns(2)
+    with col1:
+        with st.expander("🔗 Correlation Matrix (monthly %)", expanded=False):
+            df_show = corr_matrix.round(2) if isinstance(corr_matrix, pd.DataFrame) else pd.DataFrame()
+            st.dataframe(_sanitize_for_st(df_show), use_container_width=True, height=350)
+    with col2:
+        with st.expander("β vs GLI (Monthly OLS)", expanded=False):
+            df_show = betas_df.round(3) if isinstance(betas_df, pd.DataFrame) else pd.DataFrame()
+            st.dataframe(_sanitize_for_st(df_show), use_container_width=True, height=350)
 
-with col2:
-    with st.expander("β vs GLI (Monthly OLS)", expanded=False):
-        st.dataframe(_sanitize_for_st(betas_df.round(3) if isinstance(betas_df, pd.DataFrame) else pd.DataFrame()),
-                     use_container_width=True, height=350)
-
-with st.expander("📈 Monthly closes (preview)", expanded=False):
-    st.dataframe(_sanitize_for_st(monthly.tail(12) if isinstance(monthly, pd.DataFrame) else pd.DataFrame()),
-                 use_container_width=True, height=320)
+    with st.expander("📈 Monthly closes (preview)", expanded=False):
+        st.dataframe(_sanitize_for_st(monthly.tail(12) if isinstance(monthly, pd.DataFrame) else pd.DataFrame()),
+                     use_container_width=True, height=320)
