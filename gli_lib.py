@@ -1124,8 +1124,8 @@ def fed_plumbing(fred_api_key: str,
             x=vals.index, y=vals.round(1).values,
             mode="lines", name=label, line=dict(color=color, width=1.8),
             fill=("tonexty" if col != "RESERVES" else "tozeroy"),
-            fillcolor=color.replace("#", "rgba(").replace(")", ",0.12)")
-                       if "#" in color else f"rgba(0,0,0,0.08)",
+            fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.12)"
+                       if color.startswith("#") else "rgba(0,0,0,0.08)",
         ))
     fig_inject.update_layout(
         title="🏦 Fed Plumbing: Stealth Liquidity (Reserves + BTFP + MMF)",
