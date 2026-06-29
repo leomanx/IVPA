@@ -600,8 +600,8 @@ with tab_tbl:
     # ── 4-D  Statistical Validity ─────────────────────────────
     st.subheader("🔬 Statistical Validity Tests")
 
-    def _sig_style(df, col, true_val="✅"):
-        return df.style.map(
+    def _sig_style(styler, col, true_val="✅"):
+        return styler.map(
             lambda v: "color:#2ca02c;font-weight:bold" if v == true_val else "",
             subset=[col]
         )
