@@ -1,354 +1,761 @@
-# pages/02_GLI_Dashboard.py
-import os, math
+"""
+pages/02_GLI_Dashboard.py — GLI Dashboard v2
+Sections: Overview | Rolling | Regime | Tables | Auto Summary
+"""
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
-import gli_lib as gl
+# ── import gli_lib ────────────────────────────────────────────
+try:
+    import gli_lib as gl
+except Exception as _e:
+    st.error(f"ไม่สามารถ import gli_lib: {_e}")
+    st.stop()
 
-# ---------------- Page & Style ----------------
-st.set_page_config(page_title="GLI Dashboard", layout="wide")
-st.markdown("""
-<style>
-  .block-container {max-width: 1500px;}
-  .stPlotlyChart {background: transparent;}
-</style>
-""", unsafe_allow_html=True)
+# ═══════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════
+st.set_page_config(page_title="GLI Dashboard", layout="wide", page_icon="🌊")
 
-# ---------------- Helpers (safe display / names) ----------------
-def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [" - ".join([str(x) for x in tup if str(x)!=""]) for tup in out.columns.values]
-    else:
-        out.columns = [str(c) for c in out.columns]
-    return out
+# ─── colour palette ─────────────────────────────────────────
+_COLORS = {
+    "GLI":    ("#1f77b4", "solid",   3.0),
+    "NASDAQ": ("#ff7f0e", "solid",   1.8),
+    "SP500":  ("#2ca02c", "dot",     1.8),
+    "GOLD":   ("#c8b400", "dashdot", 1.8),
+    "BTC":    ("#f7931a", "dash",    1.8),
+    "ETH":    ("#627eea", "dash",    1.8),
+}
+def _color(name):
+    c = _COLORS.get(name, ("#888888", "solid", 1.5))
+    return dict(color=c[0], dash=c[1], width=c[2])
 
-def _to_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """ทำ DF ให้ปลอดภัยต่อ st.dataframe/Arrow (รวม MultiIndex, Period/Datetime index, object dtype)."""
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
+# ═══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.header("⚙️ Settings")
+    start_yr   = st.slider("Start Year", 2004, 2022, 2008)
+    start      = f"{start_yr}-01-01"
+    years_n    = st.slider("CAGR Window (years)", 5, 20, 10)
+    rf_pct     = st.number_input("Risk-free Rate (%/yr)", 0.0, 10.0, 2.0, step=0.25)
+    rf_annual  = rf_pct / 100.0
+    st.divider()
+    roll_win   = st.slider("Rolling Window (months)", 6, 36, 12)
+    n_q        = st.slider("GLI Quantiles (Regime)", 3, 5, 5)
+    max_lag    = st.slider("Max Lead/Lag (months)", 6, 18, 12)
+    fwd_horiz  = st.multiselect("Forward Horizons (months)", [1,3,6,12,24], default=[1,3,6,12])
+    if not fwd_horiz:
+        fwd_horiz = [3]
+    fwd_horiz = sorted(fwd_horiz)
+    st.divider()
+    show_norm  = st.checkbox("GLI Normalisation (M2 / Z-Score)", value=False,
+                             help="เรียก FRED เพิ่มสำหรับ M2SL — อาจช้ากว่า")
+    if st.button("♻️ Clear Cache & Refresh"):
+        st.cache_data.clear()
+        st.rerun()
 
-    out = df.copy()
+# ═══════════════════════════════════════════════════════════════
+# API KEY
+# ═══════════════════════════════════════════════════════════════
+_raw   = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", ""))
+fred_k = gl.sanitize_fred_key(_raw)
 
-    # --- normalize index ---
-    if isinstance(out.index, pd.MultiIndex):
-        out = out.reset_index()
-        lvl_cols = [c for c in out.columns if str(c).startswith("level_")]
-        if lvl_cols:
-            out.insert(0, "Index", out[lvl_cols].astype(str).agg(" - ".join, axis=1))
-            out.drop(columns=lvl_cols, inplace=True)
-    elif not isinstance(out.index, pd.RangeIndex):
-        # Datetime/Period/อื่น ๆ → string
-        try:
-            idx_str = out.index.astype(str)
-        except Exception:
-            idx_str = out.index.map(lambda x: str(getattr(x, "to_timestamp", lambda: x)()))
-        out.insert(0, "Index", idx_str)
-        out = out.reset_index(drop=True)
+if not fred_k:
+    st.warning("⚠️ ยังไม่พบ FRED_API_KEY — ใส่ใน App → Settings → Secrets")
+    st.stop()
+if not gl.validate_fred_key_format(fred_k):
+    st.error(f"❌ รูปแบบ FRED_API_KEY ไม่ถูกต้อง ({gl.mask_key(fred_k)})")
+    st.stop()
 
-    # --- column names to str ---
-    out.columns = [str(c) for c in out.columns]
-
-    # --- object columns to primitive/string ---
-    for c in out.columns:
-        if pd.api.types.is_object_dtype(out[c]):
-            out[c] = out[c].apply(lambda v: v.item() if isinstance(v, np.generic) else v)
-            out[c] = out[c].apply(lambda v: v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
-    return out
-
-def _fmt_pct(x):
-    if x is None: return "—"
-    try:
-        if isinstance(x, (float, int)) and not np.isnan(x) and not np.isinf(x):
-            return f"{x*100:.2f}%"
-    except Exception:
-        pass
-    return "—"
-
-def _safe_get_series(df: pd.DataFrame, col: str) -> pd.Series:
-    if isinstance(df, pd.DataFrame) and col in df.columns:
-        return df[col]
-    return pd.Series(dtype=float)
-
-def _pick_col(df: pd.DataFrame, candidates) -> str | None:
-    """เลือกคอลัมน์แบบยืดหยุ่น (รับทั้งชื่อเดี่ยว หรือชื่อที่ถูกแปลงจาก MultiIndex เช่น 'NASDAQ - 0')."""
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    cols = [str(c) for c in df.columns]
-
-    # ตรงตัวก่อน
-    for t in candidates:
-        if t in cols:
-            return t
-
-    # แบบ contains / ขอบ-กลาง (รองรับพวก "('NASDAQ', 0)" -> ถูก flatten เป็น "NASDAQ - 0")
-    low_cols = [c.lower() for c in cols]
-    for t in candidates:
-        t_low = str(t).lower()
-        for i, c_low in enumerate(low_cols):
-            if (t_low in c_low) or c_low.startswith(t_low + " -") or c_low.endswith("- " + t_low):
-                return cols[i]
-    return None
-
-# ---------------- Sidebar ----------------
-st.sidebar.caption("GLI: Fed + ECB + BoJ − TGA − ONRRP (+PBoC optional)")
-start     = st.sidebar.text_input("Start (YYYY-MM-DD)", "2008-01-01")
-years_n   = st.sidebar.number_input("CAGR lookback (years)", 5, 25, 10, step=1)
-rf_annual = st.sidebar.number_input("Risk-free (annual)", 0.00, 0.10, 0.02, step=0.0025, format="%.4f")
-win_m     = st.sidebar.slider("Rolling window (months)", 6, 36, 12, step=1)
-refresh   = st.sidebar.button("🔄 Refresh cache")
-if refresh:
-    st.cache_data.clear()
-
-fred_key = (st.secrets.get("FRED_API_KEY", "") or os.environ.get("FRED_API_KEY","")).strip()
-
-# ---------------- Cached loaders (ค้าง cache ข้าม page) ----------------
-@st.cache_data(show_spinner=True)
-def _load_all_cached(fred_api_key: str, start: str, years_for_cagr: int, risk_free_annual: float):
+# ═══════════════════════════════════════════════════════════════
+# DATA LOADING  (cached, network-heavy)
+# ═══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3_600, show_spinner="⏳ ดึงข้อมูล FRED + Yahoo Finance…")
+def _load(key, start, yrs, rf, norm):
     return gl.load_all(
-        fred_api_key=fred_api_key,
-        start=start,
-        end=None,
-        years_for_cagr=years_for_cagr,
-        risk_free_annual=risk_free_annual,
-        include_pboc=False,
-        pboc_series_id=None
+        fred_api_key=key, start=start,
+        years_for_cagr=yrs, risk_free_annual=rf,
+        normalize=norm, pboc_series_id=None,
     )
 
-@st.cache_data(show_spinner=False)
-def _rolling_cached(monthly_rets: pd.DataFrame, window: int):
-    return gl.rolling_corr_beta_alpha(monthly_rets, window=window)
+try:
+    D = _load(fred_k, start, int(years_n), rf_annual, show_norm)
+except gl.FredKeyError as e:
+    st.error("❌ ปัญหา FRED API Key")
+    st.code(str(e))
+    st.stop()
+except Exception as e:
+    st.error("เกิดข้อผิดพลาดระหว่างโหลดข้อมูล")
+    st.exception(e)
+    st.stop()
 
-@st.cache_data(show_spinner=False)
-def _regime_cached(monthly: pd.DataFrame, monthly_rets: pd.DataFrame):
-    return gl.regime_and_events(monthly, monthly_rets)
+wk         = D["wk"]
+monthly    = D["monthly"]
+mr         = D["monthly_rets"]
+annual     = D["annual"]
+met_tbl    = D["metrics_table"]
+corr_mx    = D["corr_matrix"]
+betas_df   = D["betas_df"]
+rebased_m  = D["rebased_m"]
+ann_fig    = D["annual_yoy_fig"]
+wk_norm    = D.get("wk_norm")
 
-# ---------------- Load all once ----------------
-with st.spinner("Loading GLI & assets..."):
-    data = _load_all_cached(fred_key, start, int(years_n), float(rf_annual))
+# ═══════════════════════════════════════════════════════════════
+# ADVANCED ANALYSIS  (cached per data+params, fast computation)
+# ═══════════════════════════════════════════════════════════════
+_adv_key = f"{start}_{fred_k[:4]}_{max_lag}_{tuple(fwd_horiz)}_{n_q}"
 
-# unpack
-wk              = data.get("wk")
-monthly         = _flatten_cols(data.get("monthly"))
-monthly_rets    = _flatten_cols(data.get("monthly_rets"))
-annual          = _flatten_cols(data.get("annual"))
-metrics_table   = _flatten_cols(data.get("metrics_table"))
-corr_matrix     = _flatten_cols(data.get("corr_matrix"))
-betas_df        = _flatten_cols(data.get("betas_df"))
-rebased_m       = _flatten_cols(data.get("rebased_m"))
-annual_yoy_fig  = data.get("annual_yoy_fig")
+if st.session_state.get("_adv_key") != _adv_key:
+    with st.spinner("🔬 คำนวณ Advanced Analysis…"):
+        st.session_state["ll"]     = gl.lead_lag_analysis(mr, max_lag=max_lag)
+        st.session_state["stats"]  = gl.statistical_tests(monthly, mr, max_lag_granger=6)
+        st.session_state["fwd"]    = gl.forward_return_analysis(
+                                         monthly, mr,
+                                         horizons=fwd_horiz, n_quantiles=n_q)
+        st.session_state["reg"]    = gl.regime_and_events(monthly, mr)
+        st.session_state["prf"]    = gl.perf_regime_table(
+                                         mr, st.session_state["reg"]["regime_df"])
+        st.session_state["_adv_key"] = _adv_key
 
-# fallback annual_yoy_fig (ในกรณี lib ยังไม่ได้คืนมา)
-if annual_yoy_fig is None and isinstance(monthly, pd.DataFrame) and not monthly.empty:
-    ann = monthly.resample("A-DEC").last().pct_change().dropna() * 100.0
-    ann = ann.rename(columns={"GLI_INDEX": "GLI_%YoY"})
-    fig = go.Figure()
-    if "GLI_%YoY" in ann.columns:
-        fig.add_trace(go.Scatter(x=ann.index, y=ann["GLI_%YoY"], mode="lines+markers", name="GLI YoY"))
-    for c in [c for c in ann.columns if c != "GLI_%YoY"]:
-        fig.add_trace(go.Bar(x=ann.index, y=ann[c], name=f"{c} YoY"))
-    fig.update_layout(
-        title="Annual YoY: GLI (line) vs Assets (bars)",
-        barmode="group", hovermode="x unified",
-        legend=dict(orientation="h", y=1.02),
+ll_res  = st.session_state["ll"]
+st_res  = st.session_state["stats"]
+fwd_res = st.session_state["fwd"]
+reg     = st.session_state["reg"]
+prf_tbl = st.session_state["prf"]
+
+# ─── unpack regime ───────────────────────────────────────────
+reg_df    = reg["regime_df"]
+exp_per   = reg["expansion_periods"]
+evt_up    = reg["evt_up"]
+evt_dn    = reg["evt_down"]
+
+# ═══════════════════════════════════════════════════════════════
+# KPI STRIP
+# ═══════════════════════════════════════════════════════════════
+st.title("🌊 GLI Dashboard")
+st.caption(f"Global Liquidity Index · อัปเดต {wk.index[-1].strftime('%d %b %Y')}")
+
+gli_now  = wk["GLI_INDEX"].iloc[-1]
+gli_wow  = wk["GLI_INDEX"].pct_change().iloc[-1] * 100
+gli_yoy  = wk["GLI_INDEX"].pct_change(52).iloc[-1] * 100
+is_exp   = gli_yoy > 0
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("GLI Index",  f"{gli_now:.1f}",  f"{gli_wow:+.2f}% WoW")
+k2.metric("GLI YoY %",  f"{gli_yoy:+.1f}%",
+          "🟢 Expansion" if is_exp else "🔴 Contraction")
+
+if wk_norm is not None and "GLI_ZSCORE_36M" in wk_norm.columns:
+    zs = wk_norm["GLI_ZSCORE_36M"].dropna().iloc[-1]
+    z_note = ("🔥 Extreme high" if zs > 1.5 else
+              "❄️ Extreme low"  if zs < -1.5 else "Normal range")
+    k3.metric("Z-Score 36M", f"{zs:+.2f}", z_note)
+    if "GLI_ACC" in wk_norm.columns:
+        acc = wk_norm["GLI_ACC"].dropna().iloc[-1]
+        k4.metric("GLI Acceleration", f"{acc:+.2f}%/mo",
+                  "⬆️ Speeding up" if acc > 0 else "⬇️ Slowing down")
+    else:
+        k4.metric("GLI Acceleration", "—", "")
+else:
+    k3.metric("Z-Score 36M",   "—", "Enable Normalise ↙")
+    k4.metric("GLI Acceleration", "—", "Enable Normalise ↙")
+
+fwd_3m = fwd_res["fwd_yoy"].get("3M")
+if fwd_3m is not None and not fwd_3m.dropna(how="all").empty:
+    top_q    = fwd_3m.index[-1]
+    best_a   = fwd_3m.loc[top_q].dropna().idxmax()
+    best_v   = fwd_3m.loc[top_q].dropna().max()
+    gli_pct  = ((monthly["GLI_INDEX"].pct_change(12).dropna()*100) <= gli_yoy).mean()*100
+    k5.metric(f"Best Asset @ {top_q}", f"{best_a} ({best_v:+.1f}%)",
+              f"GLI at {gli_pct:.0f}th pctile now")
+else:
+    k5.metric("Best Fwd Asset", "—", "")
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════
+tab_ov, tab_roll, tab_reg, tab_tbl = st.tabs([
+    "📈 Overview", "📉 Rolling", "🧭 Regime", "📋 Tables"
+])
+
+# ───────────────────────────────────────────────────────────────
+# TAB 1 : OVERVIEW
+# ───────────────────────────────────────────────────────────────
+with tab_ov:
+    # ── Rebased chart ─────────────────────────────────────────
+    st.subheader("Price Index — GLI & Assets (Base = 100)")
+    fig_reb = go.Figure()
+    for col in rebased_m.columns:
+        name = col if col != "GLI_INDEX" else "GLI"
+        fig_reb.add_trace(go.Scatter(
+            x=rebased_m.index, y=rebased_m[col].round(2),
+            mode="lines", name=name, line=_color(name),
+            hovertemplate=f"<b>{name}</b>: %{{y:.1f}}<extra></extra>",
+        ))
+    for s, e in exp_per:
+        fig_reb.add_vrect(x0=s, x1=e, fillcolor="rgba(0,180,0,0.06)", line_width=0)
+    fig_reb.update_layout(
+        hovermode="x unified", height=460,
+        legend=dict(orientation="h", y=1.05),
         xaxis=dict(rangeslider=dict(visible=True)),
-        margin=dict(t=50, l=40, r=20, b=40), height=420
+        yaxis_title="Index (Base=100)",
     )
-    annual_yoy_fig = fig
+    st.plotly_chart(fig_reb, use_container_width=True)
+    st.caption("พื้นที่เขียวอ่อน = GLI Expansion  |  Base = วันแรกของข้อมูล")
 
-# rolling & regime (cached)
-roll = _rolling_cached(monthly_rets, int(win_m))
-roll_corr_m_df = _flatten_cols(roll.get("corr"))
-roll_beta_m_df = _flatten_cols(roll.get("beta"))
-roll_alpha_m_df= _flatten_cols(roll.get("alpha"))
-
-reg = _regime_cached(monthly, monthly_rets)
-regime_df      = reg.get("regime_df")
-exp_periods    = reg.get("expansion_periods") or []
-evt_up         = reg.get("evt_up")
-evt_down       = reg.get("evt_down")
-
-# ---------------- Title ----------------
-st.title("GLI Dashboard")
-
-# ---------------- KPI row ----------------
-colA, colB, colC, colD, colE = st.columns(5)
-
-gli_full = gl.cagr_from_series(_safe_get_series(annual, "GLI_INDEX"))
-gli_n    = gl.cagr_last_n_years(_safe_get_series(annual, "GLI_INDEX"), int(years_n))
-
-# --- เลือกคอลัมน์ NASDAQ / GOLD แบบยืดหยุ่น ---
-nas_col  = _pick_col(annual, ["NASDAQ", "NDX", "IXIC"])
-gold_col = _pick_col(annual, ["GOLD", "GC=F", "XAUUSD"])
-
-nas_full  = gl.cagr_from_series(_safe_get_series(annual, nas_col))  if nas_col  else np.nan
-gold_full = gl.cagr_from_series(_safe_get_series(annual, gold_col)) if gold_col else np.nan
-
-colA.metric("GLI CAGR (full)", _fmt_pct(gli_full))
-colB.metric(f"GLI CAGR ({int(years_n)}y)", _fmt_pct(gli_n))
-
-# Liquidity-adjusted (asset − GLI)
-nas_liq = (nas_full - gli_full) if (pd.notna(nas_full) and pd.notna(gli_full)) else np.nan
-gold_liq= (gold_full - gli_full) if (pd.notna(gold_full) and pd.notna(gli_full)) else np.nan
-colC.metric("NASDAQ − GLI (CAGR)", _fmt_pct(nas_liq))
-colD.metric("GOLD − GLI (CAGR)",   _fmt_pct(gold_liq))
-
-shp_gli = gl.sharpe(_safe_get_series(monthly_rets, "GLI_INDEX"), float(rf_annual), 12) if "GLI_INDEX" in monthly_rets.columns else np.nan
-colE.metric("Sharpe (GLI)", f"{shp_gli:.2f}" if pd.notna(shp_gli) else "—")
-
-# ---------------- Tabs ----------------
-tab_main, tab_roll, tab_regime, tab_tables = st.tabs(
-    ["📈 Overview", "📉 Rolling", "🧭 Regime", "📋 Tables"]
-)
-
-# ---------- Tab: Overview ----------
-with tab_main:
-    st.subheader("Rebased = 100 (Monthly)")
-    if isinstance(rebased_m, pd.DataFrame) and not rebased_m.empty:
-        # Selector
-        show_cols = st.multiselect(
-            "Show series",
-            options=list(rebased_m.columns),
-            default=list(rebased_m.columns),
-            key="rebased_sel",
-            help="ซ่อน/แสดงซีรีส์ที่ต้องการ"
-        )
-        fig_rebase = go.Figure()
-        for col in rebased_m.columns:
-            fig_rebase.add_trace(
-                go.Scatter(
-                    x=rebased_m.index, y=rebased_m[col], mode="lines", name=col,
-                    visible=True if col in show_cols else "legendonly"
-                )
+    # ── Annual YoY + Metrics side-by-side ─────────────────────
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.subheader("Annual YoY %")
+        st.plotly_chart(ann_fig, use_container_width=True)
+    with c2:
+        st.subheader("Performance Summary")
+        if not met_tbl.empty:
+            num_cols = [c for c in met_tbl.columns if c != "Asset"]
+            mdd_cols = [c for c in num_cols if "MaxDD" in c]
+            pos_cols = [c for c in num_cols if c not in mdd_cols]
+            styled = (
+                met_tbl.style
+                    .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                              else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
+                              subset=pos_cols)
+                    .applymap(lambda v: f"color:rgb({min(int(abs(v if isinstance(v,(int,float)) else 0)/80*255),255)},0,0)"
+                              if isinstance(v,(int,float)) else "", subset=mdd_cols)
+                    .format({c: "{:.2f}" for c in num_cols}, na_rep="—")
             )
-        fig_rebase.update_layout(
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
-            xaxis=dict(rangeslider=dict(visible=True)),
-            margin=dict(t=30, l=40, r=20, b=40),
-            height=480
-        )
-        st.plotly_chart(fig_rebase, use_container_width=True, config={"displaylogo": False})
-    else:
-        st.info("No rebased data.")
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=320)
 
-    st.markdown("#### Annual YoY: GLI (line) vs Assets (bars)")
-    if annual_yoy_fig is not None:
-        st.plotly_chart(annual_yoy_fig, use_container_width=True, config={"displaylogo": False})
-    else:
-        st.info("No annual YoY figure.")
-
-# ---------- Tab: Rolling ----------
+# ───────────────────────────────────────────────────────────────
+# TAB 2 : ROLLING
+# ───────────────────────────────────────────────────────────────
 with tab_roll:
-    st.subheader(f"Rolling {int(win_m)}-Month vs GLI (Monthly Returns)")
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_rc = go.Figure()
-        if isinstance(roll_corr_m_df, pd.DataFrame) and not roll_corr_m_df.empty:
-            for col in [c for c in roll_corr_m_df.columns if c != "GLI_INDEX"]:
-                fig_rc.add_trace(go.Scatter(x=roll_corr_m_df.index, y=roll_corr_m_df[col], mode="lines", name=col))
-        fig_rc.update_layout(title="Correlation", hovermode="x unified",
-                             legend=dict(orientation="h", y=1.02),
-                             xaxis=dict(rangeslider=dict(visible=True)),
-                             yaxis=dict(range=[-1,1]))
-        st.plotly_chart(fig_rc, use_container_width=True, config={"displaylogo": False})
-    with c2:
-        fig_rb = go.Figure()
-        if isinstance(roll_beta_m_df, pd.DataFrame) and not roll_beta_m_df.empty:
-            for col in [c for c in roll_beta_m_df.columns if c != "GLI_INDEX"]:
-                fig_rb.add_trace(go.Scatter(x=roll_beta_m_df.index, y=roll_beta_m_df[col], mode="lines", name=col))
-        fig_rb.update_layout(title="Beta", hovermode="x unified",
-                             legend=dict(orientation="h", y=1.02),
-                             xaxis=dict(rangeslider=dict(visible=True)))
-        st.plotly_chart(fig_rb, use_container_width=True, config={"displaylogo": False})
+    roll_data  = gl.rolling_corr_beta_alpha(mr, window=roll_win)
+    assets_av  = [c for c in mr.columns if c != "GLI_INDEX"]
+    sel        = st.multiselect("เลือก Asset", assets_av, default=assets_av, key="roll_sel")
+    if not sel:
+        sel = assets_av
 
-    fig_ra = go.Figure()
-    if isinstance(roll_alpha_m_df, pd.DataFrame) and not roll_alpha_m_df.empty:
-        for col in [c for c in roll_alpha_m_df.columns if c != "GLI_INDEX"]:
-            fig_ra.add_trace(go.Scatter(x=roll_alpha_m_df.index, y=roll_alpha_m_df[col], mode="lines", name=col))
-    fig_ra.update_layout(title="Alpha (approx, %/mo)", hovermode="x unified",
-                         legend=dict(orientation="h", y=1.02),
-                         xaxis=dict(rangeslider=dict(visible=True)))
-    st.plotly_chart(fig_ra, use_container_width=True, config={"displaylogo": False})
+    _roll_panels = [
+        ("corr",  f"Rolling Correlation vs GLI (window={roll_win}M)",  "Pearson r",   0.0),
+        ("beta",  f"Rolling Beta vs GLI (window={roll_win}M)",          "Beta",        None),
+        ("alpha", f"Rolling Alpha — residual return (window={roll_win}M)", "Alpha %/mo", 0.0),
+    ]
+    for key, title, ytitle, zero_line in _roll_panels:
+        df_r = roll_data[key][sel].dropna(how="all")
+        fig  = go.Figure()
+        for col in df_r.columns:
+            fig.add_trace(go.Scatter(x=df_r.index, y=df_r[col].round(4),
+                                     mode="lines", name=col, line=_color(col)))
+        if zero_line is not None:
+            fig.add_hline(y=zero_line, line_dash="dash", line_color="rgba(120,120,120,0.5)")
+        for s, e in exp_per:
+            fig.add_vrect(x0=s, x1=e, fillcolor="rgba(0,180,0,0.05)", line_width=0)
+        fig.update_layout(
+            title=title, hovermode="x unified", height=300,
+            legend=dict(orientation="h", y=1.05),
+            xaxis=dict(rangeslider=dict(visible=(key == "alpha"))),
+            yaxis_title=ytitle,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Tab: Regime ----------
-with tab_regime:
-    st.subheader("GLI Regime (YoY>0 = Expansion) & Event Study")
-    # Rebased + shading
-    if isinstance(rebased_m, pd.DataFrame) and not rebased_m.empty:
-        fig_reg = go.Figure()
-        for col in rebased_m.columns:
-            fig_reg.add_trace(go.Scatter(x=rebased_m.index, y=rebased_m[col], mode="lines", name=col))
-        for s, e in exp_periods:
-            fig_reg.add_vrect(x0=s, x1=e, fillcolor="LightGreen", opacity=0.18, line_width=0)
-        fig_reg.update_layout(hovermode="x unified", legend=dict(orientation="h", y=1.02),
-                              xaxis=dict(rangeslider=dict(visible=True)))
-        st.plotly_chart(fig_reg, use_container_width=True, config={"displaylogo": False})
+    with st.expander("📋 Current Rolling Values (latest month)"):
+        last_vals = {}
+        for key in ("corr", "beta", "alpha"):
+            last_vals[key] = roll_data[key][sel].dropna(how="all").iloc[-1].round(3)
+        st.dataframe(pd.DataFrame(last_vals, index=sel).rename(
+            columns={"corr":"Corr","beta":"Beta","alpha":"Alpha %/mo"}
+        ), use_container_width=True)
 
-    # GLI YoY vs GOLD %/mo
+# ───────────────────────────────────────────────────────────────
+# TAB 3 : REGIME  (enhanced)
+# ───────────────────────────────────────────────────────────────
+with tab_reg:
+
+    # ── 3-A  GLI YoY + Expansion Shading ──────────────────────
+    st.subheader("GLI Cycle — Expansion / Contraction")
+    fig_regime = gl.gli_yoy_vs_gold(monthly, mr, reg_df, exp_per)
+    st.plotly_chart(fig_regime, use_container_width=True)
+
+    # Expansion stats
+    n_exp = sum((e - s).days for s, e in exp_per)
+    n_tot = (wk.index[-1] - wk.index[0]).days
+    st.caption(
+        f"🟢 Expansion: {len(exp_per)} episodes · "
+        f"{100*n_exp/max(n_tot,1):.0f}% of total time  |  "
+        f"Avg duration: {n_exp//max(len(exp_per),1)//30:.0f} months"
+    )
+
+    # ── 3-B  Z-Score + Acceleration ───────────────────────────
+    if wk_norm is not None:
+        st.subheader("GLI Normalisation Signals")
+        c_z, c_a = st.columns(2)
+
+        with c_z:
+            if "GLI_ZSCORE_36M" in wk_norm.columns:
+                z = wk_norm["GLI_ZSCORE_36M"].dropna()
+                fig_z = go.Figure()
+                fig_z.add_trace(go.Scatter(x=z.index, y=z.values, mode="lines", name="Z-Score",
+                    fill="tozeroy", fillcolor="rgba(31,119,180,0.12)",
+                    line=dict(color="#1f77b4", width=1.5)))
+                for lvl, col, lbl in [(1.5,"#d62728","Extreme High"), (-1.5,"#1a56db","Extreme Low")]:
+                    fig_z.add_hline(y=lvl, line_dash="dot", line_color=col,
+                                    annotation_text=lbl, annotation_position="right")
+                fig_z.update_layout(title="GLI Z-Score (36M rolling)", height=300,
+                                    yaxis_title="Z", hovermode="x unified")
+                st.plotly_chart(fig_z, use_container_width=True)
+
+        with c_a:
+            if "GLI_ACC" in wk_norm.columns:
+                acc = wk_norm["GLI_ACC"].dropna()
+                colors_acc = np.where(acc.values > 0, "#2ca02c", "#d62728")
+                fig_a = go.Figure()
+                fig_a.add_trace(go.Bar(x=acc.index, y=acc.values, name="Acceleration",
+                                        marker_color=colors_acc))
+                fig_a.add_hline(y=0, line_color="gray", line_width=0.8)
+                fig_a.update_layout(title="GLI Acceleration Δ(YoY%)/month", height=300,
+                                    yaxis_title="Δ YoY% per month", hovermode="x unified")
+                st.plotly_chart(fig_a, use_container_width=True)
+
+        if "GLI_M2_INDEX" in wk_norm.columns:
+            st.markdown("**GLI / M2 Index** (raw GLI adjusted for US M2 growth)")
+            m2i = wk_norm["GLI_M2_INDEX"].dropna()
+            fig_m2 = go.Figure()
+            fig_m2.add_trace(go.Scatter(x=m2i.index, y=m2i.values, mode="lines",
+                                         name="GLI/M2 Index", line=dict(color="#9467bd", width=1.8)))
+            fig_m2.add_trace(go.Scatter(x=wk["GLI_INDEX"].index, y=wk["GLI_INDEX"].values,
+                                         mode="lines", name="GLI Index (raw)",
+                                         line=dict(color="#1f77b4", dash="dot", width=1.2), opacity=0.6))
+            fig_m2.update_layout(height=280, hovermode="x unified",
+                                  legend=dict(orientation="h", y=1.05))
+            st.plotly_chart(fig_m2, use_container_width=True)
+    else:
+        st.info("💡 เปิด **GLI Normalisation** ใน Sidebar เพื่อดู Z-Score, Acceleration, GLI/M2")
+
+    st.divider()
+
+    # ── 3-C  Lead / Lag ───────────────────────────────────────
+    st.subheader("📡 Lead / Lag Analysis")
+    c_ccf, c_opt = st.columns([3, 2])
+
+    with c_ccf:
+        st.plotly_chart(ll_res["fig"], use_container_width=True)
+
+    with c_opt:
+        st.markdown("**Optimal Lag per Asset**")
+        opt_df = ll_res["optimal_lags"]
+        def _dir_color(v):
+            if "GLI leads" in str(v): return "color:#2ca02c;font-weight:bold"
+            if "Asset leads" in str(v): return "color:#d62728"
+            return ""
+        def _sig_color(v):
+            return "color:#2ca02c;font-weight:bold" if v == "✅" else ""
+        st.dataframe(
+            opt_df[["Asset","Optimal_Lag(mo)","Direction","Max_|Corr|","Sig_95%"]]
+              .style.applymap(_dir_color, subset=["Direction"])
+                    .applymap(_sig_color, subset=["Sig_95%"])
+                    .format({"Optimal_Lag(mo)": "{:.0f}", "Max_|Corr|": "{:.3f}"}, na_rep="—"),
+            use_container_width=True, hide_index=True,
+        )
+        ci = ll_res["ci95"]
+        n_mo = len(mr.dropna())
+        st.caption(f"95% CI: ±{ci:.3f}  |  N = {n_mo} months")
+
+        # Quick interpretation
+        leaders = opt_df[opt_df["Optimal_Lag(mo)"] > 0]
+        if not leaders.empty:
+            best = leaders.sort_values("Max_|Corr|", ascending=False).iloc[0]
+            st.success(
+                f"GLI นำ **{best['Asset']}** ที่ lag **{int(best['Optimal_Lag(mo)'])} เดือน** "
+                f"(r = {best['Max_|Corr|']:.3f})"
+            )
+
+    st.divider()
+
+    # ── 3-D  Forward Return Heatmaps ──────────────────────────
+    st.subheader("🔮 Predictive — Forward Return by GLI Quantile")
+
+    heat_yoy, heat_mom = st.tabs(["📊 GLI YoY Signal (Cycle)", "⚡ GLI MoM Signal (Momentum)"])
+
+    def _draw_heatmap(df, title, h, y_suffix, n_q):
+        """Draw a single forward-return heatmap."""
+        if df is None or df.dropna(how="all").empty:
+            st.info("ข้อมูลไม่เพียงพอสำหรับ heatmap นี้")
+            return
+        _max = max(abs(df.stack().dropna().abs().max()), 0.01)
+        z    = df.values.tolist()
+        txt  = [[f"{v:.1f}%" if pd.notna(v) else "—" for v in row] for row in z]
+        ylab = [f"{idx}  ({y_suffix})" for idx in df.index]
+        fig  = go.Figure(go.Heatmap(
+            z=z, x=df.columns.tolist(), y=ylab,
+            colorscale="RdYlGn", zmid=0, zmin=-_max, zmax=_max,
+            text=txt, texttemplate="%{text}",
+            colorbar=dict(title=f"{h}M Fwd %", len=0.8),
+            hovertemplate="Asset: %{x}<br>GLI Bin: %{y}<br>Avg Fwd Return: %{text}<extra></extra>",
+        ))
+        fig.update_layout(
+            title=f"{title}<br><sup>Q1 / M1 = GLI weakest · Q{n_q} / M{n_q} = GLI strongest</sup>",
+            height=320, margin=dict(l=170),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with heat_yoy:
+        h_y = st.select_slider("Horizon", fwd_horiz,
+                                value=min(3, max(fwd_horiz)), key="hy")
+        _draw_heatmap(fwd_res["fwd_yoy"].get(f"{h_y}M"),
+                      f"Avg {h_y}-Month Forward Return — GLI YoY Quantile",
+                      h_y, "GLI YoY%", n_q)
+
+        hit_y = fwd_res["hit_rate_yoy"].get(f"{h_y}M")
+        if hit_y is not None:
+            with st.expander(f"Hit Rate — % เดือนที่ผลตอบแทน > 0  (horizon {h_y}M)"):
+                st.dataframe(
+                    hit_y.style.background_gradient(cmap="RdYlGn", vmin=30, vmax=70)
+                               .format("{:.0f}%", na_rep="—"),
+                    use_container_width=True,
+                )
+
+        with st.expander("ทุก Horizon — GLI YoY Signal"):
+            for h in fwd_horiz:
+                df_h = fwd_res["fwd_yoy"].get(f"{h}M")
+                if df_h is not None:
+                    st.markdown(f"**{h}M:**")
+                    st.dataframe(
+                        df_h.style.background_gradient(cmap="RdYlGn", axis=None)
+                                  .format("{:.1f}%", na_rep="—"),
+                        use_container_width=True,
+                    )
+
+    with heat_mom:
+        h_m = st.select_slider("Horizon", fwd_horiz,
+                                value=min(3, max(fwd_horiz)), key="hm")
+        _draw_heatmap(fwd_res["fwd_mom"].get(f"{h_m}M"),
+                      f"Avg {h_m}-Month Forward Return — GLI MoM Quantile",
+                      h_m, "GLI MoM%", n_q)
+
+        hit_m = fwd_res["hit_rate_mom"].get(f"{h_m}M")
+        if hit_m is not None:
+            with st.expander(f"Hit Rate — % เดือนที่ผลตอบแทน > 0  (horizon {h_m}M)"):
+                st.dataframe(
+                    hit_m.style.background_gradient(cmap="RdYlGn", vmin=30, vmax=70)
+                               .format("{:.0f}%", na_rep="—"),
+                    use_container_width=True,
+                )
+
+    st.divider()
+
+    # ── 3-E  Performance by Regime ────────────────────────────
+    st.subheader("📊 Performance by GLI Regime")
+    c_prf, c_evt = st.columns(2)
+
+    with c_prf:
+        st.markdown("**Avg Monthly Return (%) — Expansion vs Contraction**")
+        try:
+            avg_r = prf_tbl["Avg_%/mo"].copy()
+            std_r = prf_tbl["Std_%/mo"].copy()
+            if "GLI_INDEX" in avg_r.columns:
+                avg_r = avg_r.drop(columns=["GLI_INDEX"])
+                std_r = std_r.drop(columns=["GLI_INDEX"])
+            avg_r.index = avg_r.index.map({True: "🟢 Expansion", False: "🔴 Contraction"})
+            std_r.index = std_r.index.map({True: "🟢 Expansion", False: "🔴 Contraction"})
+            st.dataframe(
+                avg_r.style.background_gradient(cmap="RdYlGn", axis=1)
+                           .format("{:.2f}%", na_rep="—"),
+                use_container_width=True,
+            )
+            with st.expander("Std Dev by Regime"):
+                st.dataframe(std_r.style.format("{:.2f}%", na_rep="—"),
+                             use_container_width=True)
+        except Exception as _e:
+            st.dataframe(prf_tbl, use_container_width=True)
+
+    with c_evt:
+        st.markdown("**Event Study — Cumulative Return After Regime Change**")
+        ev_up_tab, ev_dn_tab = st.tabs(["↑ After Upturn (C→E)", "↓ After Downturn (E→C)"])
+
+        def _style_event(df):
+            return (df.style
+                      .background_gradient(cmap="RdYlGn", axis=None)
+                      .format("{:.1f}%", na_rep="—"))
+
+        with ev_up_tab:
+            if evt_up is not None and not evt_up.empty:
+                st.dataframe(_style_event(evt_up), use_container_width=True)
+                st.caption("ค่าเฉลี่ยผลตอบแทนสะสมหลัง GLI พลิกกลับจาก Contraction → Expansion")
+            else:
+                st.info("ข้อมูลไม่พอสำหรับ event study")
+
+        with ev_dn_tab:
+            if evt_dn is not None and not evt_dn.empty:
+                st.dataframe(_style_event(evt_dn), use_container_width=True)
+                st.caption("ค่าเฉลี่ยผลตอบแทนสะสมหลัง GLI พลิกกลับจาก Expansion → Contraction")
+            else:
+                st.info("ข้อมูลไม่พอสำหรับ event study")
+
+# ───────────────────────────────────────────────────────────────
+# TAB 4 : TABLES  (enhanced)
+# ───────────────────────────────────────────────────────────────
+with tab_tbl:
+
+    # ── 4-A  Metrics ──────────────────────────────────────────
+    st.subheader("📊 Performance Metrics")
+    if not met_tbl.empty:
+        num_cols = [c for c in met_tbl.columns if c != "Asset"]
+        mdd_cols = [c for c in num_cols if "MaxDD" in c]
+        pos_cols = [c for c in num_cols if c not in mdd_cols]
+        st.dataframe(
+            met_tbl.style
+                .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                          else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
+                          subset=pos_cols)
+                .applymap(lambda v: f"background-color:rgba(214,39,40,"
+                          f"{min(abs(v if isinstance(v,(int,float)) else 0)/80,1)*0.35})"
+                          if isinstance(v,(int,float)) else "", subset=mdd_cols)
+                .format({c: "{:.2f}" for c in num_cols}, na_rep="—"),
+            use_container_width=True, hide_index=True, height=240,
+        )
+
+    # ── 4-B  Correlation Heatmap ──────────────────────────────
+    st.subheader("🔗 Correlation Matrix — Monthly Returns")
+    cols_c = corr_mx.columns.tolist()
+    fig_cx = go.Figure(go.Heatmap(
+        z=corr_mx.round(3).values.tolist(),
+        x=cols_c, y=cols_c,
+        colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
+        text=corr_mx.round(2).values.tolist(),
+        texttemplate="%{text}",
+        colorbar=dict(title="r", len=0.8),
+    ))
+    fig_cx.update_layout(
+        height=380,
+        xaxis=dict(side="bottom"),
+        title="Pearson Correlation (monthly %MoM, full period)",
+    )
+    st.plotly_chart(fig_cx, use_container_width=True)
+
+    # ── 4-C  Beta / Alpha ─────────────────────────────────────
+    st.subheader("📐 Beta & Alpha vs GLI — Full Period OLS")
+    if not betas_df.empty:
+        def _beta_bg(v):
+            if not isinstance(v, (int, float)): return ""
+            intensity = min(abs(v) / 2.5, 1.0) * 0.35
+            return (f"background-color:rgba(44,160,44,{intensity:.2f})" if v > 0
+                    else f"background-color:rgba(214,39,40,{intensity:.2f})")
+        st.dataframe(
+            betas_df.style
+                .applymap(_beta_bg, subset=["Beta_vs_GLI"])
+                .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                          else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
+                          subset=["Alpha_%/mo"])
+                .format("{:.4f}", na_rep="—"),
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ── 4-D  Statistical Validity ─────────────────────────────
+    st.subheader("🔬 Statistical Validity Tests")
+
+    def _sig_style(df, col, true_val="✅"):
+        return df.style.applymap(
+            lambda v: "color:#2ca02c;font-weight:bold" if v == true_val else "",
+            subset=[col]
+        )
+
+    s_adf, s_coint, s_gr = st.tabs([
+        "ADF — Stationarity",
+        "Engle-Granger — Cointegration",
+        "Granger Causality",
+    ])
+
+    with s_adf:
+        st.markdown("""
+**ADF (Augmented Dickey-Fuller)** ทดสอบว่า series เป็น I(0) หรือ I(1)
+
+| ผล | ความหมาย |
+|---|---|
+| ✅ Stationary | ใช้ regression level ได้โดยตรง |
+| ❌ Unit root (level) | ควร first-difference ก่อน หรือตรวจ cointegration |
+| ❌ Unit root (return) | ⚠️ return ยัง non-stationary — ระวัง spurious regression |
+        """)
+        adf = st_res.get("adf_table", pd.DataFrame())
+        if not adf.empty:
+            st.dataframe(
+                _sig_style(
+                    adf.style.format({"ADF_stat":"{:.3f}","p_value":"{:.4f}",
+                                      "CV_1%":"{:.3f}","CV_5%":"{:.3f}"}, na_rep="—"),
+                    "Stationary"
+                ),
+                use_container_width=True, hide_index=True,
+            )
+
+    with s_coint:
+        st.markdown("""
+**Engle-Granger Cointegration** ทดสอบว่า GLI และ Asset มี long-run equilibrium
+
+| ผล | ความหมาย |
+|---|---|
+| ✅ Cointegrated | long-run tie มีอยู่ → ECM ใช้ได้, regression level ไม่ spurious |
+| — Not cointegrated | ใช้ returns เท่านั้น, regression level อาจ spurious |
+        """)
+        coint = st_res.get("coint_table", pd.DataFrame())
+        if not coint.empty:
+            st.dataframe(
+                _sig_style(
+                    coint.style.format({"EG_stat":"{:.3f}","p_value":"{:.4f}",
+                                        "CV_5%":"{:.3f}"}, na_rep="—"),
+                    "Cointegrated"
+                ),
+                use_container_width=True, hide_index=True,
+            )
+
+    with s_gr:
+        st.markdown("""
+**Granger Causality: GLI%MoM → Asset%MoM**
+ทดสอบว่า *ข้อมูลอดีตของ GLI* ช่วยพยากรณ์ Asset ได้จริงหรือไม่
+(เชิง predictive; ไม่ใช่เชิงสาเหตุ mechanistic)
+
+| ผล | ความหมาย |
+|---|---|
+| ✅ p < 0.05 | GLI อดีตมีนัยสำคัญในการพยากรณ์ Asset นั้น |
+| —  p ≥ 0.05 | ไม่มีหลักฐาน Granger-predictive |
+        """)
+        gr = st_res.get("granger_table", pd.DataFrame())
+        if not gr.empty:
+            disp = ["GLI → Asset","Best_Lag(mo)","F_stat","p_value","GLI_causes_Asset"]
+            st.dataframe(
+                _sig_style(
+                    gr[disp].style.format({"F_stat":"{:.3f}","p_value":"{:.4f}",
+                                           "Best_Lag(mo)":"{:.0f}"}, na_rep="—"),
+                    "GLI_causes_Asset"
+                ),
+                use_container_width=True, hide_index=True,
+            )
+            with st.expander("p-value ทุก lag"):
+                st.dataframe(
+                    gr[["GLI → Asset","All_lag_p"]].rename(
+                        columns={"All_lag_p":"p-value per lag"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+        # ── Lead/Lag summary table (cross-reference) ──────────
+        st.markdown("---")
+        st.markdown("**Lead/Lag Optimal Lags (quick reference)**")
+        opt = ll_res["optimal_lags"]
+        st.dataframe(
+            _sig_style(
+                opt[["Asset","Optimal_Lag(mo)","Direction","Max_|Corr|","Corr_lag0","Sig_95%"]]
+                   .style.format({"Optimal_Lag(mo)":"{:.0f}","Max_|Corr|":"{:.3f}",
+                                  "Corr_lag0":"{:.3f}"}, na_rep="—"),
+                "Sig_95%"
+            ),
+            use_container_width=True, hide_index=True,
+        )
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO SUMMARY  (bottom, always visible)
+# ═══════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("📝 Auto Summary")
+
+col_c, col_a = st.columns(2)
+
+with col_c:
+    with st.expander("📊 Classic Summary", expanded=True):
+        try:
+            txt = gl.auto_summary(met_tbl, betas_df, evt_up, evt_dn, prf_tbl)
+            st.text(txt)
+        except Exception as _e:
+            st.warning(f"Classic summary error: {_e}")
+
+with col_a:
+    with st.expander("🔬 Advanced Summary", expanded=True):
+        try:
+            txt = gl.advanced_summary(ll_res, st_res, fwd_res)
+            st.text(txt)
+        except Exception as _e:
+            st.warning(f"Advanced summary error: {_e}")
+
+# ── Full Report ───────────────────────────────────────────────
+with st.expander("📋 Full Narrative Report (Download)"):
     try:
-        fig_gold_yoy = gl.gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods)
-        st.plotly_chart(fig_gold_yoy, use_container_width=True, config={"displaylogo": False})
-    except Exception:
-        pass
+        lines = [
+            "═══ GLI DASHBOARD FULL REPORT ═══",
+            f"Generated : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} UTC",
+            f"Data range: {wk.index[0].strftime('%d %b %Y')} → {wk.index[-1].strftime('%d %b %Y')}",
+            f"Settings  : start={start}  CAGR={years_n}Y  Rf={rf_pct:.2f}%  Q={n_q}  Lag={max_lag}M",
+            "",
+            "──── 1. CURRENT GLI STATE ────────────────────────────────",
+            f"GLI Index : {gli_now:.1f}   WoW: {gli_wow:+.2f}%   YoY: {gli_yoy:+.1f}%",
+            f"Regime    : {'🟢 EXPANSION' if is_exp else '🔴 CONTRACTION'}",
+        ]
 
-    st.markdown("##### Event Study — Avg cumulative returns after regime switch")
-    st.caption("Upturn = GLI หด→ขยาย, Downturn = GLI ขยาย→หด; วัดผลสะสมถัดไป 3/6/12 เดือน")
+        if wk_norm is not None and "GLI_ZSCORE_36M" in wk_norm.columns:
+            zs = wk_norm["GLI_ZSCORE_36M"].dropna().iloc[-1]
+            lines.append(f"Z-Score   : {zs:+.2f}  "
+                         f"({'Extreme High' if zs>1.5 else 'Extreme Low' if zs<-1.5 else 'Normal'})")
+        lines.append("")
 
-    evt_up_disp   = _to_display_df(evt_up)   if isinstance(evt_up, pd.DataFrame) else pd.DataFrame()
-    evt_down_disp = _to_display_df(evt_down) if isinstance(evt_down, pd.DataFrame) else pd.DataFrame()
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**หลัง Upturn**")
-        st.dataframe(evt_up_disp, use_container_width=True, height=320)
-    with c2:
-        st.markdown("**หลัง Downturn**")
-        st.dataframe(evt_down_disp, use_container_width=True, height=320)
+        # Lead/Lag
+        opt = ll_res["optimal_lags"]
+        lines.append("──── 2. LEAD / LAG FINDINGS ──────────────────────────────")
+        for _, r in opt.iterrows():
+            sig = "✅ Sig" if r.get("Sig_95%") == "✅" else "—"
+            lines.append(f"  {r['Asset']:8s} lag={int(r['Optimal_Lag(mo)']):+3d}M  "
+                         f"r={r['Max_|Corr|']:.3f}  {r['Direction']}  {sig}")
+        lines.append("")
 
-    # Auto summary (Thai) — ทำให้ข้อความสะอาด ไม่ซ้ำชื่อ tuple
-    try:
-        perf_tbl = gl.perf_regime_table(monthly_rets, regime_df)
-        summary_txt = gl.auto_summary(metrics_table, betas_df, evt_up, evt_down, perf_tbl)
-        summary_txt = summary_txt.replace("('", "").replace("')", "").replace(" - ", " ").replace("_%/mo", "")
-        st.markdown("#### 📌 Auto Summary")
-        st.info(summary_txt)
-    except Exception:
-        pass
+        # Granger
+        gr = st_res.get("granger_table", pd.DataFrame())
+        lines.append("──── 3. GRANGER CAUSALITY (GLI → Asset) ─────────────────")
+        for _, r in gr.iterrows():
+            lines.append(f"  {r['GLI → Asset']:8s}  p={r['p_value']:.4f}  "
+                         f"lag={r['Best_Lag(mo)']}M  {r['GLI_causes_Asset']}")
+        lines.append("")
 
-# ---------- Tab: Tables ----------
-with tab_tables:
-    st.subheader("Tables (compact)")
+        # Predictive outlook
+        gli_pctile = ((monthly["GLI_INDEX"].pct_change(12).dropna()*100) <= gli_yoy).mean()*100
+        lines.append("──── 4. PREDICTIVE OUTLOOK ────────────────────────────────")
+        lines.append(f"Current GLI YoY: {gli_yoy:+.1f}%  (historical {gli_pctile:.0f}th percentile)")
+        for h in fwd_horiz:
+            df_h = fwd_res["fwd_yoy"].get(f"{h}M")
+            if df_h is None: continue
+            top_row = df_h.iloc[-1].dropna().sort_values(ascending=False)
+            bot_row = df_h.iloc[0].dropna().sort_values(ascending=False)
+            lines.append(f"  {h:2d}M fwd if GLI=Q{n_q} (strong): "
+                         + "  ".join(f"{a}:{v:+.1f}%" for a, v in top_row.items()))
+            lines.append(f"  {h:2d}M fwd if GLI=Q1 (weak) : "
+                         + "  ".join(f"{a}:{v:+.1f}%" for a, v in bot_row.items()))
+        lines.append("")
 
-    with st.expander("📊 Liquidity-Adjusted & Risk Metrics", expanded=True):
-        st.dataframe(_to_display_df(metrics_table), use_container_width=True, height=360)
+        # Classic + Advanced
+        try:
+            lines.append("──── 5. CLASSIC ANALYSIS ──────────────────────────────────")
+            lines.append(gl.auto_summary(met_tbl, betas_df, evt_up, evt_dn, prf_tbl))
+            lines.append("")
+        except Exception:
+            pass
+        try:
+            lines.append("──── 6. ADVANCED ANALYSIS ─────────────────────────────────")
+            lines.append(gl.advanced_summary(ll_res, st_res, fwd_res))
+        except Exception:
+            pass
 
-    # สี Heatmap ของ Correlation (plotly) + ตารางดิบ
-    st.markdown("#### Correlation (monthly %)")
-    c1, c2 = st.columns([3,2], vertical_alignment="top")
-    with c1:
-        if isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.empty:
-            cm = corr_matrix.copy()
-            if cm.shape[0] > 30:
-                cm = cm.iloc[:30, :30]
-            fig_hm = px.imshow(cm, text_auto=False, zmin=-1, zmax=1,
-                               color_continuous_scale="RdBu", origin="lower",
-                               aspect="auto", title="Correlation heatmap")
-            fig_hm.update_layout(margin=dict(t=50, l=40, r=20, b=40), height=500)
-            st.plotly_chart(fig_hm, use_container_width=True, config={"displaylogo": False})
-        else:
-            st.info("No correlation matrix.")
-    with c2:
-        st.dataframe(_to_display_df(corr_matrix.round(2)), use_container_width=True, height=500)
+        report = "\n".join(lines)
+        st.text(report)
+        st.download_button(
+            label="⬇️ Download Report (.txt)",
+            data=report,
+            file_name=f"GLI_Report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.txt",
+            mime="text/plain",
+        )
+    except Exception as _e:
+        st.warning(f"Report error: {_e}")
 
-    col1, col2 = st.columns(2, vertical_alignment="top")
-    with col1:
-        with st.expander("β vs GLI (Monthly OLS)", expanded=False):
-            st.dataframe(_to_display_df(betas_df.round(3)), use_container_width=True, height=350)
-    with col2:
-        with st.expander("📈 Monthly closes (preview)", expanded=False):
-            st.dataframe(_to_display_df(monthly.tail(12)), use_container_width=True, height=350)
+st.caption("© 2025 — GLI Dashboard v2  |  FRED + Yahoo Finance  |  gl.advanced_summary()")
