@@ -55,6 +55,12 @@ with st.sidebar:
     st.divider()
     show_norm  = st.checkbox("GLI Normalisation (M2 / Z-Score)", value=False,
                              help="เรียก FRED เพิ่มสำหรับ M2SL — อาจช้ากว่า")
+    extra_ast  = st.checkbox("Extra Assets (Copper, DXY)", value=False,
+                             help="เพิ่ม Copper + DXY Broad เข้า asset universe")
+    show_plumb = st.checkbox("🔧 Fed Plumbing Panel", value=False,
+                             help="Reserves, BTFP, MMF, HY Spread, Yield Curve, DXY, Copper")
+    show_yen   = st.checkbox("🇯🇵 Yen Carry Trade Panel", value=False,
+                             help="USDJPY, Carry State, Unwind Detection, VIX, BOJ Impact on GLI")
     if st.button("♻️ Clear Cache & Refresh"):
         st.cache_data.clear()
         st.rerun()
@@ -76,15 +82,16 @@ if not gl.validate_fred_key_format(fred_k):
 # DATA LOADING  (cached, network-heavy)
 # ═══════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3_600, show_spinner="⏳ ดึงข้อมูล FRED + Yahoo Finance…")
-def _load(key, start, yrs, rf, norm):
+def _load(key, start, yrs, rf, norm, extra):
     return gl.load_all(
         fred_api_key=key, start=start,
         years_for_cagr=yrs, risk_free_annual=rf,
-        normalize=norm, pboc_series_id=None,
+        normalize=norm, extra_assets=extra,
+        pboc_series_id=None,
     )
 
 try:
-    D = _load(fred_k, start, int(years_n), rf_annual, show_norm)
+    D = _load(fred_k, start, int(years_n), rf_annual, show_norm, extra_ast)
 except gl.FredKeyError as e:
     st.error("❌ ปัญหา FRED API Key")
     st.code(str(e))
@@ -223,10 +230,10 @@ with tab_ov:
             pos_cols = [c for c in num_cols if c not in mdd_cols]
             styled = (
                 met_tbl.style
-                    .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                    .map(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
                               else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
                               subset=pos_cols)
-                    .applymap(lambda v: f"color:rgb({min(int(abs(v if isinstance(v,(int,float)) else 0)/80*255),255)},0,0)"
+                    .map(lambda v: f"color:rgb({min(int(abs(v if isinstance(v,(int,float)) else 0)/80*255),255)},0,0)"
                               if isinstance(v,(int,float)) else "", subset=mdd_cols)
                     .format({c: "{:.2f}" for c in num_cols}, na_rep="—")
             )
@@ -358,8 +365,8 @@ with tab_reg:
             return "color:#2ca02c;font-weight:bold" if v == "✅" else ""
         st.dataframe(
             opt_df[["Asset","Optimal_Lag(mo)","Direction","Max_|Corr|","Sig_95%"]]
-              .style.applymap(_dir_color, subset=["Direction"])
-                    .applymap(_sig_color, subset=["Sig_95%"])
+              .style.map(_dir_color, subset=["Direction"])
+                    .map(_sig_color, subset=["Sig_95%"])
                     .format({"Optimal_Lag(mo)": "{:.0f}", "Max_|Corr|": "{:.3f}"}, na_rep="—"),
             use_container_width=True, hide_index=True,
         )
@@ -511,10 +518,10 @@ with tab_tbl:
         pos_cols = [c for c in num_cols if c not in mdd_cols]
         st.dataframe(
             met_tbl.style
-                .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                .map(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
                           else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
                           subset=pos_cols)
-                .applymap(lambda v: f"background-color:rgba(214,39,40,"
+                .map(lambda v: f"background-color:rgba(214,39,40,"
                           f"{min(abs(v if isinstance(v,(int,float)) else 0)/80,1)*0.35})"
                           if isinstance(v,(int,float)) else "", subset=mdd_cols)
                 .format({c: "{:.2f}" for c in num_cols}, na_rep="—"),
@@ -549,8 +556,8 @@ with tab_tbl:
                     else f"background-color:rgba(214,39,40,{intensity:.2f})")
         st.dataframe(
             betas_df.style
-                .applymap(_beta_bg, subset=["Beta_vs_GLI"])
-                .applymap(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
+                .map(_beta_bg, subset=["Beta_vs_GLI"])
+                .map(lambda v: "color:#2ca02c" if isinstance(v,(int,float)) and v>0
                           else ("color:#d62728" if isinstance(v,(int,float)) and v<0 else ""),
                           subset=["Alpha_%/mo"])
                 .format("{:.4f}", na_rep="—"),
@@ -563,7 +570,7 @@ with tab_tbl:
     st.subheader("🔬 Statistical Validity Tests")
 
     def _sig_style(df, col, true_val="✅"):
-        return df.style.applymap(
+        return df.style.map(
             lambda v: "color:#2ca02c;font-weight:bold" if v == true_val else "",
             subset=[col]
         )
@@ -759,3 +766,255 @@ with st.expander("📋 Full Narrative Report (Download)"):
         st.warning(f"Report error: {_e}")
 
 st.caption("© 2025 — GLI Dashboard v2  |  FRED + Yahoo Finance  |  gl.advanced_summary()")
+
+# ═══════════════════════════════════════════════════════════════
+# 🔧 FED PLUMBING PANEL  (optional, below main dashboard)
+# ═══════════════════════════════════════════════════════════════
+if show_plumb:
+    st.divider()
+    st.header("🔧 Fed Plumbing & Stealth Liquidity")
+    st.markdown("""
+> **Fed มีเครื่องมือควบคุมสภาพคล่องแบบ "อ้อมๆ"** ที่ไม่ปรากฏใน headline WALCL
+> แต่ส่งผลต่อตลาดอย่างมีนัยสำคัญ — ติดตามรายการเหล่านี้เพื่อเห็น "น้ำจริง" ในระบบ
+    """)
+
+    # Fetch (cached separately, start from 2020 เพื่อเห็น COVID + BTFP cycle)
+    plumb_start = st.selectbox("Plumbing Start Year", ["2015","2018","2020","2022"],
+                               index=2, key="plumb_start")
+
+    @st.cache_data(ttl=3_600, show_spinner="🔬 ดึง Fed Plumbing data…")
+    def _plumb(key, s):
+        return gl.fed_plumbing(key, start=s)
+
+    try:
+        P = _plumb(fred_k, f"{plumb_start}-01-01")
+
+        # ── Summary Table ─────────────────────────────────────
+        st.subheader("📋 Current Readings")
+        tbl = P["summary_tbl"]
+        if not tbl.empty:
+            def _mom_color(v):
+                if not isinstance(v, (int, float)): return ""
+                return "color:#2ca02c" if v > 0 else "color:#d62728"
+            num_cols = ["Latest", "MoM %", "YoY %"]
+            st.dataframe(
+                tbl.style
+                    .map(_mom_color, subset=["MoM %", "YoY %"])
+                    .format({c: "{:.2f}" for c in num_cols}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.caption(
+            "Reserve Balances + BTFP = stealth inject  |  "
+            "MMF ⬆ = เงินหนีความเสี่ยง  |  "
+            "HY Spread ⬇ = liquidity ส่งถึงตลาด  |  "
+            "DXY ⬆ = ดูด global dollar"
+        )
+
+        st.divider()
+
+        # ── 3 charts row ─────────────────────────────────────
+        c_inj, c_str = st.columns([3, 2])
+        with c_inj:
+            st.plotly_chart(P["fig_inject"], use_container_width=True)
+        with c_str:
+            st.plotly_chart(P["fig_stress"], use_container_width=True)
+
+        c_glb, c_cu = st.columns([3, 2])
+        with c_glb:
+            st.plotly_chart(P["fig_global"], use_container_width=True)
+        with c_cu:
+            st.plotly_chart(P["fig_copper"], use_container_width=True)
+
+        # ── Net Fed Liquidity ─────────────────────────────────
+        net = P.get("net_fed_liq", pd.Series(dtype=float))
+        if not net.dropna().empty:
+            st.subheader("🧮 Net Fed Liquidity = Reserves + BTFP")
+            fig_net = go.Figure()
+            fig_net.add_trace(go.Scatter(
+                x=net.index, y=net.round(1).values,
+                mode="lines", name="Net Fed Liq (B USD)",
+                fill="tozeroy", fillcolor="rgba(31,119,180,0.13)",
+                line=dict(color="#1f77b4", width=2),
+            ))
+            fig_net.update_layout(
+                height=280, hovermode="x unified",
+                yaxis_title="Billions USD",
+                xaxis=dict(rangeslider=dict(visible=True)),
+            )
+            st.plotly_chart(fig_net, use_container_width=True)
+            st.caption(
+                "Net Fed Liq = Reserve Balances + Emergency Loans(BTFP)  "
+                "↑ สูง = ธนาคารมีสภาพคล่องมาก → risk-on  "
+                "↓ ต่ำ = ธนาคารระวังตัว → ระวัง stress event"
+            )
+
+        # ── Interpretation Guide ─────────────────────────────
+        with st.expander("📖 วิธีอ่าน Fed Plumbing"):
+            st.markdown("""
+| Instrument | Signal บวก (inject) | Signal ลบ (drain) |
+|---|---|---|
+| **Reserve Balances** | สูง = ธนาคารมีเงินสำรองมาก → กล้าปล่อยสินเชื่อ/risk | ต่ำ = ธนาคารระวัง → credit tightening |
+| **BTFP/Emergency Loans** | พุ่งขึ้น = Fed กำลัง inject แบบเงียบๆ (SVB 2023) | ≈ 0 = ไม่มีวิกฤต |
+| **MMF Assets** | ลด = เงินไหลออกจาก MMF → risk assets ได้รับเงิน | เพิ่ม = เงินหนีความเสี่ยง จอดใน MMF |
+| **HY Spread** | ต่ำ (<300bps) = ตลาดเปิดรับความเสี่ยง | สูง (>500bps) = credit stress แม้ GLI ดี ก็ไม่ส่งผ่าน |
+| **10Y-2Y Curve** | บวก + steepen = growth expected | ลบ (inversion) = recession signal |
+| **DXY Broad** | อ่อน = dollar ไหลออกสู่โลก → EM/crypto ดี | แข็ง = ดูด global dollar กลับ US |
+| **China FX** | เพิ่ม = PBOC inject / ไม่ต้องป้องหยวน | ลด = PBOC ขาย USD ป้องค่าหยวน = ดูด global liquidity |
+| **Copper** | ขึ้น = demand จริง → GLI expansion มักตามมา | ลง = ความต้องการชะลอ → GLI อาจหด |
+
+**วิธีอ่านแบบรวม:**
+- GLI ขึ้น + Reserves ขึ้น + HY Spread แคบ = **Full Liquidity Expansion** → risk-on strong
+- GLI ขึ้น + MMF สูง + HY Spread กว้าง = **Liquidity Trapped** → เงินมีแต่ยังไม่ถึงตลาด
+- GLI ลง + BTFP พุ่ง = **Stealth Support** → Fed อาจกำลัง backstop วิกฤตเงียบๆ
+- DXY แข็ง + China FX ลด = **Global Dollar Squeeze** → EM/BTC ระวัง
+            """)
+
+    except gl.FredKeyError as e:
+        st.error(f"FRED Key Error: {e}")
+    except Exception as e:
+        st.error("Fed Plumbing data load error")
+        st.exception(e)
+
+# ═══════════════════════════════════════════════════════════════
+# 🇯🇵 YEN CARRY TRADE PANEL
+# ═══════════════════════════════════════════════════════════════
+if show_yen:
+    st.divider()
+    st.header("🇯🇵 Yen Carry Trade & Unwind Analysis")
+    st.markdown("""
+> **Yen Carry Trade** = กู้ JPY ดอกเบี้ย ~0% → ลงทุนใน USD risk assets
+> เมื่อ JPY แข็งกลับอย่างรวดเร็ว → **Unwind** = ขาย risk assets บังคับพร้อมกันทั่วโลก
+> 
+> 🔗 **GLI Connection:** BOJ_USD = BOJ_JPY ÷ USDJPY
+> ดังนั้น JPY แข็ง → BOJ_USD ขึ้น → GLI formula ขึ้น **แต่ตลาดร่วง** — Contradiction ที่ต้องระวัง
+    """)
+
+    yen_start = st.selectbox("Yen Analysis Start Year",
+                             ["2012","2015","2018","2020","2022"],
+                             index=2, key="yen_start")
+
+    @st.cache_data(ttl=3_600, show_spinner="🇯🇵 วิเคราะห์ Yen Carry Trade…")
+    def _yen(wk_json, key, s):
+        _wk = pd.read_json(wk_json)
+        _wk.index = pd.to_datetime(_wk.index)
+        return gl.yen_carry_analysis(_wk, fred_api_key=key, start=s)
+
+    try:
+        YC = _yen(wk.to_json(), fred_k, f"{yen_start}-01-01")
+        cs = YC["current_state"]
+
+        # ── KPI Strip ─────────────────────────────────────────
+        st.subheader("📊 Current Yen Carry State")
+        y1, y2, y3, y4, y5 = st.columns(5)
+        y1.metric("USD/JPY Now",
+                  f"{cs['USDJPY']:.2f}",
+                  f"{cs['MoM_%']:+.2f}% (4W)" if pd.notna(cs['MoM_%']) else "—")
+        y2.metric("3-Month Change",
+                  f"{cs['3M_%']:+.1f}%" if pd.notna(cs['3M_%']) else "—",
+                  cs["Unwind_Status"])
+        y3.metric("Carry State", cs["Carry_State"], "")
+        y4.metric("VIX",
+                  f"{cs['VIX_latest']:.1f}" if pd.notna(cs['VIX_latest']) else "—",
+                  "🔴 Panic" if pd.notna(cs['VIX_latest']) and cs['VIX_latest'] > 30
+                  else ("⚠️ Caution" if pd.notna(cs['VIX_latest']) and cs['VIX_latest'] > 20 else "🟢 Calm"))
+        y5.metric("BOJ Share of GLI",
+                  f"{cs['BOJ_GLI_share_%']:.1f}%" if pd.notna(cs['BOO_GLI_share_%'] if 'BOO_GLI_share_%' in cs else cs.get('BOJ_GLI_share_%')) else "—",
+                  "ยิ่งสูง = USDJPY มีผลกับ GLI มากขึ้น")
+
+        # ── Interpretation Box ────────────────────────────────
+        unwind_txt = cs["Unwind_Status"]
+        if "MAJOR" in unwind_txt or "🚨" in unwind_txt:
+            st.error(f"🚨 {unwind_txt} — พิจารณา defensive allocation ทันที")
+        elif "Minor" in unwind_txt or "⚠️" in unwind_txt:
+            st.warning(f"⚠️ {unwind_txt} — ติดตามอย่างใกล้ชิด")
+        else:
+            st.success(f"✅ {unwind_txt}")
+
+        st.divider()
+
+        # ── Charts Row 1 ──────────────────────────────────────
+        st.plotly_chart(YC["fig_usdjpy"], use_container_width=True)
+
+        c_mom, c_vix = st.columns(2)
+        with c_mom:
+            st.plotly_chart(YC["fig_mom"], use_container_width=True)
+        with c_vix:
+            st.plotly_chart(YC["fig_vix"], use_container_width=True)
+
+        # ── BOJ Impact on GLI ─────────────────────────────────
+        st.plotly_chart(YC["fig_boj_impact"], use_container_width=True)
+
+        # ── Unwind Events Table ───────────────────────────────
+        st.subheader("📋 Unwind Events History")
+        uw = YC["unwind_events"]
+        if not uw.empty:
+            def _sev_bg(v):
+                if v == "Severe": return "background-color:rgba(214,39,40,0.25);font-weight:bold"
+                if v == "Major":  return "background-color:rgba(255,127,14,0.20)"
+                if v == "Minor":  return "background-color:rgba(255,200,0,0.15)"
+                return ""
+
+            uw_disp = uw.copy()
+            for col in ["Start","Peak"]:
+                if col in uw_disp.columns:
+                    uw_disp[col] = pd.to_datetime(uw_disp[col]).dt.strftime("%d %b %Y")
+            st.dataframe(
+                uw_disp.style.map(_sev_bg, subset=["Severity"])
+                             .format({"USDJPY_at_Peak": "{:.2f}",
+                                      "USDJPY_drop_%": "{:.2f}%"}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(f"พบ {len(uw)} unwind events | "
+                       f"Severe: {(uw['Severity']=='Severe').sum()} | "
+                       f"Major: {(uw['Severity']=='Major').sum()} | "
+                       f"Minor: {(uw['Severity']=='Minor').sum()}")
+        else:
+            st.info("ไม่พบ unwind events ในช่วงเวลาที่เลือก")
+
+        # ── Yen Carry Guide ───────────────────────────────────
+        with st.expander("📖 คู่มือ Yen Carry Trade สำหรับมือใหม่"):
+            st.markdown("""
+**Yen Carry Trade คืออะไร?**
+1. กู้เงิน JPY ในอัตราดอกเบี้ย ~0% (BOJ คงนโยบายผ่อนคลายมาทศวรรษ)
+2. แปลง JPY → USD (ขาย JPY, ซื้อ USD → JPY อ่อนค่า USDJPY ขึ้น)
+3. ลงทุนใน US Stocks, Bonds, หรือ risk assets อื่นๆ
+4. รับกำไรจากส่วนต่างดอกเบี้ย + capital gain จาก USD assets
+5. เมื่อ USD อ่อน/JPY แข็ง → กำไรน้อยลง → ถ้าขาดทุน → **ต้องปิด position**
+
+**ทำไม Unwind ถึงรุนแรง?**
+- Carry trade เป็น leveraged position ขนาดใหญ่มาก (ประมาณ $4 Trillion)
+- เมื่อ JPY แข็งกะทันหัน → ทุกคน unwind พร้อมกัน → ขาย risk assets พร้อมกัน
+- ก่อให้เกิด cascade: JPY แข็ง → BTC ลง → NASDAQ ลง → VIX พุ่ง → panic ยิ่งใหญ่
+
+**Unwind Signals:**
+| Signal | ค่า | ความหมาย |
+|---|---|---|
+| USDJPY 4W change | < −3% | Minor unwind เริ่ม |
+| USDJPY 4W change | < −7% | Major unwind — defensive |
+| USDJPY 4W change | < −12% | Severe (Aug 2024 level) |
+| VIX | > 20 | ตลาดเริ่มตื่นกลัว |
+| VIX | > 30 | Panic zone — carry unwind มักอยู่ที่นี่ |
+| VIX | > 40 | Crisis level |
+
+**Historical Unwind Events:**
+| ปี | USDJPY Drop | สาเหตุ | ผลกระทบ |
+|---|---|---|---|
+| 2008 | 127→88 (−31%) | GFC | หุ้นโลกร่วง 50%+ |
+| 2011 | ค่าเงินผันผวนหลังสึนามิ | Disaster + BOJ intervention | เยนแข็งมาก |
+| 2016 | Brexit + Trump | ความไม่แน่นอนทางการเมือง | เยนแข็งสั้นๆ |
+| 2022 | BOJ เริ่มขึ้นดอกเบี้ย | YCC policy change | เยนอ่อนก่อน แล้วแข็ง |
+| ส.ค. 2024 | 157→141 (−10.2%) | BOJ ขึ้น rate surprise | BTC −20%, Nikkei −12% ใน 3 วัน |
+
+**GLI Contradiction:**
+- เมื่อ JPY แข็ง → BOJ_USD (ส่วนประกอบของ GLI) เพิ่มขึ้น mechanically
+- ทำให้ GLI formula คำนวณได้ว่า "สภาพคล่องเพิ่ม"
+- แต่ในความเป็นจริง carry unwind = สภาพคล่องลด + risk-off
+- → ดู **GLI Acceleration** ประกอบ: ถ้าลบ = สภาพคล่องจริงลด แม้ GLI formula ขึ้น
+            """)
+
+    except Exception as _e:
+        st.error("Yen Carry Analysis error")
+        st.exception(_e)
+
+st.caption("© 2025 — GLI Dashboard v2  |  FRED + Yahoo Finance")
