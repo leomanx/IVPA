@@ -355,12 +355,15 @@ def load_all(
     annual_rets_plot = annual_rets_plot.rename(columns={"GLI_INDEX":"GLI_%YoY"})
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=annual_rets_plot.index, y=annual_rets_plot["GLI_%YoY"],
-                              mode="lines+markers", name="GLI%YoY"))
+                              mode="lines+markers+text", name="GLI%YoY",
+                              text=annual_rets_plot["GLI_%YoY"].round(1).astype(str) + '%', textposition='top center'))
     for c in [col for col in annual_rets_plot.columns if col!="GLI_%YoY"]:
-        fig2.add_trace(go.Bar(x=annual_rets_plot.index, y=annual_rets_plot[c], name=f"{c}_%YoY"))
+        fig2.add_trace(go.Bar(x=annual_rets_plot.index, y=annual_rets_plot[c], name=f"{c}_%YoY",
+                              text=annual_rets_plot[c].round(1).astype(str) + '%', textposition='auto'))
     fig2.update_layout(title="Annual YoY: GLI (line) vs Assets (bars)",
                        barmode="group", hovermode="x unified",
-                       legend=dict(orientation="h", y=1.05),
+                       legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+                       margin=dict(t=60, b=80),
                        xaxis=dict(rangeslider=dict(visible=True)))
 
     return {
@@ -440,7 +443,7 @@ def gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods):
     if "GOLD" in monthly_rets.columns:
         fig.add_trace(go.Scatter(x=monthly.index, y=monthly_rets["GOLD"], mode="lines", name="GOLD %/mo", yaxis="y2", opacity=0.6))
     for s, e in exp_periods:
-        fig.add_vrect(x0=s, x1=e, fillcolor="LightGreen", opacity=0.18, line_width=0)
+        fig.add_vrect(x0=str(s), x1=str(e), fillcolor="LightGreen", opacity=0.18, line_width=0)
     fig.update_layout(title="GLI YoY (ซ้าย) vs GOLD %/เดือน (ขวา) + Expansion",
                       hovermode="x unified",
                       legend=dict(orientation="h", y=1.05),
@@ -1129,12 +1132,13 @@ def fed_plumbing(fred_api_key: str,
         ))
     fig_inject.update_layout(
         title="🏦 Fed Plumbing: Stealth Liquidity (Reserves + BTFP + MMF)",
-        hovermode="x unified", height=380,
-        legend=dict(orientation="h", y=1.05),
+        hovermode="x unified", height=420,
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        margin=dict(t=80, b=80),
         xaxis=dict(rangeslider=dict(visible=True)),
         yaxis_title="Billions USD",
         annotations=[dict(
-            x=0.01, y=0.97, xref="paper", yref="paper",
+            x=0.5, y=1.02, xref="paper", yref="paper", xanchor="center", yanchor="bottom",
             text="⬆ Reserves & BTFP = inject  |  ⬆ MMF = risk-off (money not in market)",
             showarrow=False, font=dict(size=10, color="gray"),
         )],
@@ -1159,19 +1163,20 @@ def fed_plumbing(fred_api_key: str,
                 neg.index[np.concatenate([[True], np.diff(neg.index) > np.timedelta64(7, 'D')])],
                 neg.index[np.concatenate([np.diff(neg.index) > np.timedelta64(7, 'D'), [True]])],
             ):
-                fig_stress.add_vrect(x0=seg_start, x1=seg_end,
+                fig_stress.add_vrect(x0=str(seg_start), x1=str(seg_end),
                     fillcolor="rgba(214,39,40,0.08)", line_width=0)
     fig_stress.add_hline(y=400, line_dash="dot", line_color="#d62728", opacity=0.4,
-                          annotation_text="HY Stress >400bps", yref="y1")
+                          annotation_text="HY Stress >400bps", annotation_position="top right", yref="y1")
     fig_stress.update_layout(
         title="📉 Market Stress: HY Spread (ซ้าย) + Yield Curve (ขวา)",
-        hovermode="x unified", height=350,
-        legend=dict(orientation="h", y=1.05),
+        hovermode="x unified", height=380,
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        margin=dict(t=80, b=80),
         xaxis=dict(rangeslider=dict(visible=True)),
         yaxis=dict(title="HY OAS Spread (bps)", side="left"),
         yaxis2=dict(title="10Y−2Y (%)", overlaying="y", side="right"),
         annotations=[dict(
-            x=0.01, y=0.97, xref="paper", yref="paper",
+            x=0.5, y=1.02, xref="paper", yref="paper", xanchor="center", yanchor="bottom",
             text="พื้นที่แดง = Yield Curve Inversion (tightening cycle)",
             showarrow=False, font=dict(size=10, color="gray"),
         )],
@@ -1434,7 +1439,7 @@ def yen_carry_analysis(wk: pd.DataFrame,
             color = _SEV_COLORS.get(ev["Severity"], "rgba(200,0,0,0.1)")
             s = ev["Start"]; e = ev["Peak"]
             if pd.notna(s) and pd.notna(e):
-                fig.add_vrect(x0=s, x1=e, fillcolor=color, line_width=0)
+                fig.add_vrect(x0=str(s), x1=str(e), fillcolor=color, line_width=0)
                 fig.add_annotation(x=s, y=0.98, yref="paper",
                     text=f"⚠️{ev['Severity']}", showarrow=False,
                     font=dict(size=9, color="#c00"), xanchor="left")
@@ -1450,7 +1455,7 @@ def yen_carry_analysis(wk: pd.DataFrame,
         if is_exp and not in_exp:
             in_exp = True; exp_start = dt
         if (not is_exp or dt == expanding.index[-1]) and in_exp:
-            fig_usdjpy.add_vrect(x0=exp_start, x1=dt,
+            fig_usdjpy.add_vrect(x0=str(exp_start), x1=str(dt),
                 fillcolor="rgba(44,160,44,0.07)", line_width=0)
             in_exp = False
 
@@ -1471,8 +1476,9 @@ def yen_carry_analysis(wk: pd.DataFrame,
     fig_usdjpy.update_layout(
         title="🇯🇵 USD/JPY + Carry Trade State<br>"
               "<sup>🟢 = Carry Expanding (JPY weak)  |  🔴 shading = Unwind Event</sup>",
-        hovermode="x unified", height=400,
-        legend=dict(orientation="h", y=1.08),
+        hovermode="x unified", height=450,
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        margin=dict(t=90, b=80),
         xaxis=dict(rangeslider=dict(visible=True)),
         yaxis=dict(title="JPY per USD", side="left"),
         yaxis2=dict(title="JGB 10Y Yield (%)", overlaying="y", side="right"),
@@ -1529,8 +1535,9 @@ def yen_carry_analysis(wk: pd.DataFrame,
     _add_unwind_shading(fig_vix)
     fig_vix.update_layout(
         title="😱 VIX vs USD/JPY — Carry Unwind = VIX พุ่ง + JPY แข็ง พร้อมกัน",
-        hovermode="x unified", height=350,
-        legend=dict(orientation="h", y=1.08),
+        hovermode="x unified", height=400,
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        margin=dict(t=60, b=80),
         yaxis=dict(title="VIX", side="left"),
         yaxis2=dict(title="JPY per USD", overlaying="y", side="right"),
     )
