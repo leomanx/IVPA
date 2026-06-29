@@ -16,6 +16,30 @@ except Exception as _e:
     st.error(f"ไม่สามารถ import gli_lib: {_e}")
     st.stop()
 
+# ── Custom RdYlGn color helper (ไม่ต้องการ matplotlib) ──────────
+def _rdylgn_style(vmin: float, vmax: float, alpha: float = 0.35):
+    """
+    คืน styling function สำหรับ Styler.map() ที่ให้สี Red→Yellow→Green
+    ใช้แทน background_gradient(cmap='RdYlGn') เพื่อหลีกเลี่ยง matplotlib dependency
+    """
+    _range = max(float(vmax - vmin), 1e-9)
+    def _fn(v):
+        if not isinstance(v, (int, float)) or pd.isna(v):
+            return ""
+        t = max(0.0, min(1.0, (float(v) - vmin) / _range))
+        if t < 0.5:
+            s = t * 2                      # Red(0) → Yellow(0.5)
+            r = int(214 + (255 - 214) * s) # 214→255
+            g = int(39  + (215 - 39)  * s) # 39→215
+            b = int(40  - 40 * s)          # 40→0
+        else:
+            s = (t - 0.5) * 2              # Yellow(0.5) → Green(1)
+            r = int(255 - (255 - 44)  * s) # 255→44
+            g = int(215 - (215 - 160) * s) # 215→160
+            b = int(44 * s)                # 0→44
+        return f"background-color:rgba({r},{g},{b},{alpha})"
+    return _fn
+
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -423,7 +447,7 @@ with tab_reg:
         if hit_y is not None:
             with st.expander(f"Hit Rate — % เดือนที่ผลตอบแทน > 0  (horizon {h_y}M)"):
                 st.dataframe(
-                    hit_y.style.background_gradient(cmap="RdYlGn", vmin=30, vmax=70)
+                    hit_y.style.map(_rdylgn_style(30, 70))
                                .format("{:.0f}%", na_rep="—"),
                     use_container_width=True,
                 )
@@ -433,8 +457,10 @@ with tab_reg:
                 df_h = fwd_res["fwd_yoy"].get(f"{h}M")
                 if df_h is not None:
                     st.markdown(f"**{h}M:**")
+                    _v = df_h.stack().dropna()
+                    _vmin, _vmax = (float(_v.min()), float(_v.max())) if not _v.empty else (-20, 20)
                     st.dataframe(
-                        df_h.style.background_gradient(cmap="RdYlGn", axis=None)
+                        df_h.style.map(_rdylgn_style(_vmin, _vmax))
                                   .format("{:.1f}%", na_rep="—"),
                         use_container_width=True,
                     )
@@ -450,7 +476,7 @@ with tab_reg:
         if hit_m is not None:
             with st.expander(f"Hit Rate — % เดือนที่ผลตอบแทน > 0  (horizon {h_m}M)"):
                 st.dataframe(
-                    hit_m.style.background_gradient(cmap="RdYlGn", vmin=30, vmax=70)
+                    hit_m.style.map(_rdylgn_style(30, 70))
                                .format("{:.0f}%", na_rep="—"),
                     use_container_width=True,
                 )
@@ -472,8 +498,10 @@ with tab_reg:
             avg_r.index = avg_r.index.map({True: "🟢 Expansion", False: "🔴 Contraction"})
             std_r.index = std_r.index.map({True: "🟢 Expansion", False: "🔴 Contraction"})
             st.dataframe(
-                avg_r.style.background_gradient(cmap="RdYlGn", axis=1)
-                           .format("{:.2f}%", na_rep="—"),
+                avg_r.style.map(_rdylgn_style(
+                    float(avg_r.stack().dropna().min()) if not avg_r.stack().dropna().empty else -5,
+                    float(avg_r.stack().dropna().max()) if not avg_r.stack().dropna().empty else  5,
+                )).format("{:.2f}%", na_rep="—"),
                 use_container_width=True,
             )
             with st.expander("Std Dev by Regime"):
@@ -487,8 +515,11 @@ with tab_reg:
         ev_up_tab, ev_dn_tab = st.tabs(["↑ After Upturn (C→E)", "↓ After Downturn (E→C)"])
 
         def _style_event(df):
+            _v = df.stack().dropna()
+            _lo = float(_v.min()) if not _v.empty else -20
+            _hi = float(_v.max()) if not _v.empty else  20
             return (df.style
-                      .background_gradient(cmap="RdYlGn", axis=None)
+                      .map(_rdylgn_style(_lo, _hi))
                       .format("{:.1f}%", na_rep="—"))
 
         with ev_up_tab:
