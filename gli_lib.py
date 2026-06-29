@@ -154,14 +154,15 @@ def load_all(
     risk_free_annual=0.02,
     include_pboc=False,
     pboc_series_id=None,
-    normalize=False,          # ← ใหม่: เพิ่ม GLI/M2 normalization ใน return dict
+    normalize=False,          # เพิ่ม GLI/M2 normalization ใน return dict
+    extra_assets=False,       # เพิ่ม Copper, DXY เข้า asset universe
 ):
     """
     สร้าง GLI proxy + ดึง NASDAQ/SP500/GOLD/BTC/ETH
     คืน dict พร้อม dataframes/fig ที่หน้า Dashboard ใช้
 
-    normalize=True : เรียก gli_normalize() เพิ่มเติม → return['wk_norm'] มี
-                     GLI_M2_INDEX, GLI_ZSCORE_36M, GLI_ACC
+    normalize=True   : เรียก gli_normalize() → return['wk_norm']
+    extra_assets=True: เพิ่ม Copper (HG=F) + DXY (DTWEXBGS) เข้า universe
     """
     if Fred is None:
         raise RuntimeError("ไม่พบ fredapi — โปรดเพิ่ม fredapi ใน requirements.txt")
@@ -253,6 +254,13 @@ def load_all(
         "BTC":    {"fred": "CBBTCUSD",  "yahoo": "BTC-USD"},
         "ETH":    {"fred": None,        "yahoo": "ETH-USD"},
     }
+    if extra_assets:
+        REQUESTS.update({
+            # Copper: leading demand indicator, correlates with GLI expansion 3-6M ahead
+            "COPPER": {"fred": None,        "yahoo": "HG=F"},
+            # DXY: inverse of global dollar liquidity (stronger USD = tighter global conditions)
+            "DXY":    {"fred": "DTWEXBGS",  "yahoo": "DX-Y.NYB"},
+        })
     assets = {}
     for name, src in REQUESTS.items():
         s = pd.Series(dtype=float)
@@ -979,3 +987,611 @@ def advanced_summary(lead_lag_res: dict, stat_res: dict,
 
     lines.append("(ผลข้างต้นเป็นค่าเฉลี่ยในอดีต ไม่ใช่การรับประกันอนาคต)")
     return "\n".join(lines)
+
+# ================================================================
+# SECTION 3 : FED PLUMBING & STEALTH LIQUIDITY ANALYSIS
+# ================================================================
+
+# ── Fed Plumbing FRED Series ─────────────────────────────────────
+FED_PLUMBING_SERIES = {
+    # ── Stealth Liquidity Injections ──
+    "RESERVES":   "WRESBAL",        # Reserve Balances (weekly, billions USD)
+                                     # = สภาพคล่องจริงในระบบธนาคาร
+                                     # สูตร: Reserves ≈ WALCL − TGA − RRP
+    "BTFP_PROXY": "WLCFLPCL",       # Other Credit Extensions (weekly, millions)
+                                     # ≈ 0 ก่อน Mar 2023; พุ่ง $165B หลัง SVB
+                                     # = BTFP + Discount Window (stealth QE)
+    "MMF_ASSETS": "WRMFSL",         # Money Market Fund Assets (weekly, billions)
+                                     # $6T+ ที่จอดรอ; ลดลง = เงินไหลสู่ risk assets
+    # ── Market Stress / Liquidity Effectiveness ──
+    "HY_SPREAD":  "BAMLH0A0HYM2",   # HY OAS Spread (daily, bps)
+                                     # แคบ = liquidity ส่งถึงตลาดได้ดี
+                                     # กว้าง = ตลาดตึง แม้ GLI สูง ก็ไม่ส่งผ่าน
+    "YLD_CURVE":  "T10Y2Y",          # 10Y − 2Y Spread (daily, %)
+                                     # < 0 = inversion = tightening cycle
+                                     # un-invert ≈ turning point สำหรับ risk assets
+    # ── Global Dollar Liquidity ──
+    "DXY_BROAD":  "DTWEXBGS",        # Broad USD Index (daily)
+                                     # แข็ง = ดูด global dollar liquidity
+                                     # อ่อน = ปล่อย liquidity ออกสู่โลก (inverse GLI)
+    # ── PBOC Proxy ──
+    "CHINA_FX":   "RRFXRBCNM",       # China FX Reserves (monthly, billions USD)
+                                     # ลด = PBOC ขาย USD ป้องหยวน = ดูด global liquidity
+                                     # เพิ่ม = inject liquidity เข้าระบบ
+}
+
+# Copper via Yahoo (no FRED series for spot copper)
+_COPPER_YAHOO = "HG=F"
+
+
+def fed_plumbing(fred_api_key: str,
+                 start: str = "2020-01-01",
+                 end=None) -> dict:
+    """
+    ดึงและวิเคราะห์ Fed Liquidity Plumbing Tools:
+
+    Stealth Injections  : Reserve Balances, BTFP/Discount Window, MMF Assets
+    Market Stress       : HY Credit Spread, 10Y-2Y Yield Curve
+    Global Dollar Flow  : DXY Broad, China FX Reserves
+    Real Economy        : Copper (Dr. Copper leading indicator)
+
+    คืน dict:
+      'df_weekly'    : DataFrame weekly — Reserves, BTFP_PROXY, MMF_ASSETS, HY_SPREAD, YLD_CURVE, DXY
+      'df_monthly'   : DataFrame monthly — China FX + Copper resampled
+      'net_fed_liq'  : Series — Net Fed Liquidity = Reserves + BTFP_PROXY − MMF_ASSETS*0
+      'fig_inject'   : Plotly stacked area — Stealth Injections
+      'fig_stress'   : Plotly dual-axis — HY Spread + Yield Curve
+      'fig_global'   : Plotly dual-axis — DXY + China FX Reserves
+      'fig_copper'   : Plotly line — Copper vs GLI proxy
+      'summary_tbl'  : DataFrame สรุปค่าล่าสุด + เทียบปีก่อน
+    """
+    key = sanitize_fred_key(fred_api_key)
+    if not key or not validate_fred_key_format(key):
+        raise FredKeyError("FRED_API_KEY ไม่ถูกต้อง")
+    if Fred is None:
+        raise RuntimeError("ต้องการ fredapi")
+
+    fred = Fred(api_key=key)
+
+    # ── Fetch all series ─────────────────────────────────────────
+    raw = {}
+    for name, sid in FED_PLUMBING_SERIES.items():
+        try:
+            s = _fred_series(fred, sid, start, end)
+            raw[name] = s
+        except FredKeyError:
+            raise
+        except Exception:
+            raw[name] = pd.Series(dtype=float)
+
+    # Copper via Yahoo
+    try:
+        raw["COPPER"] = _yf_close(_COPPER_YAHOO, start=start, end=end)
+    except Exception:
+        raw["COPPER"] = pd.Series(dtype=float)
+
+    # ── Resample to weekly ───────────────────────────────────────
+    def _to_w(s):
+        """Convert any frequency to weekly (W-FRI), forward-fill."""
+        if s.dropna().empty:
+            return pd.Series(dtype=float)
+        return s.resample("W-FRI").last().ffill()
+
+    wk = pd.DataFrame({
+        "RESERVES":   _to_w(raw.get("RESERVES",   pd.Series(dtype=float))),
+        "BTFP_PROXY": _to_w(raw.get("BTFP_PROXY", pd.Series(dtype=float))),
+        "MMF_ASSETS": _to_w(raw.get("MMF_ASSETS", pd.Series(dtype=float))),
+        "HY_SPREAD":  _to_w(raw.get("HY_SPREAD",  pd.Series(dtype=float))),
+        "YLD_CURVE":  _to_w(raw.get("YLD_CURVE",  pd.Series(dtype=float))),
+        "DXY_BROAD":  _to_w(raw.get("DXY_BROAD",  pd.Series(dtype=float))),
+        "COPPER":     _to_w(raw.get("COPPER",      pd.Series(dtype=float))),
+    })
+
+    # CHINA_FX stays monthly
+    china_fx = raw.get("CHINA_FX", pd.Series(dtype=float))
+    if not china_fx.dropna().empty:
+        china_m = china_fx.resample("ME").last()
+    else:
+        china_m = pd.Series(dtype=float)
+
+    # ── Net Fed Liquidity ─────────────────────────────────────────
+    # Reserves (B) + BTFP_PROXY (M→B) = net banking system liquidity
+    # MMF represents WHERE idle cash hides (high = risk-off = not injected into market)
+    net_fed = pd.Series(dtype=float)
+    if "RESERVES" in wk.columns and wk["RESERVES"].dropna().size > 0:
+        r = wk["RESERVES"].dropna()
+        b = (wk["BTFP_PROXY"] / 1000).reindex(r.index).fillna(0)  # millions → billions
+        net_fed = (r + b).rename("Net_Fed_Liq_B")
+
+    # ── Figures ──────────────────────────────────────────────────
+
+    # Fig 1: Stealth Injections (stacked area)
+    fig_inject = go.Figure()
+    _inject_series = [
+        ("RESERVES",   "#1f77b4", "Reserve Balances (B USD)"),
+        ("BTFP_PROXY", "#d62728", "Emergency Loans / BTFP (M USD → scaled)"),
+        ("MMF_ASSETS", "#ff7f0e", "MMF Assets (B USD) — risk-off parking"),
+    ]
+    for col, color, label in _inject_series:
+        s = wk.get(col, pd.Series(dtype=float)).dropna()
+        if s.empty:
+            continue
+        # BTFP is in millions; scale to billions for chart
+        vals = s / 1000 if col == "BTFP_PROXY" else s
+        fig_inject.add_trace(go.Scatter(
+            x=vals.index, y=vals.round(1).values,
+            mode="lines", name=label, line=dict(color=color, width=1.8),
+            fill=("tonexty" if col != "RESERVES" else "tozeroy"),
+            fillcolor=color.replace("#", "rgba(").replace(")", ",0.12)")
+                       if "#" in color else f"rgba(0,0,0,0.08)",
+        ))
+    fig_inject.update_layout(
+        title="🏦 Fed Plumbing: Stealth Liquidity (Reserves + BTFP + MMF)",
+        hovermode="x unified", height=380,
+        legend=dict(orientation="h", y=1.05),
+        xaxis=dict(rangeslider=dict(visible=True)),
+        yaxis_title="Billions USD",
+        annotations=[dict(
+            x=0.01, y=0.97, xref="paper", yref="paper",
+            text="⬆ Reserves & BTFP = inject  |  ⬆ MMF = risk-off (money not in market)",
+            showarrow=False, font=dict(size=10, color="gray"),
+        )],
+    )
+
+    # Fig 2: Market Stress
+    fig_stress = go.Figure()
+    hy  = wk.get("HY_SPREAD",  pd.Series(dtype=float)).dropna()
+    yc  = wk.get("YLD_CURVE",  pd.Series(dtype=float)).dropna()
+    if not hy.empty:
+        fig_stress.add_trace(go.Scatter(x=hy.index, y=hy.round(2).values,
+            mode="lines", name="HY OAS Spread (bps)", yaxis="y1",
+            line=dict(color="#d62728", width=1.8)))
+    if not yc.empty:
+        fig_stress.add_trace(go.Scatter(x=yc.index, y=yc.round(3).values,
+            mode="lines", name="10Y−2Y Curve (%)", yaxis="y2",
+            line=dict(color="#2ca02c", width=1.8, dash="dot")))
+        # Shade inversion (YC < 0)
+        neg = yc[yc < 0]
+        if not neg.empty:
+            for seg_start, seg_end in zip(
+                neg.index[np.concatenate([[True], np.diff(neg.index.astype(np.int64)) > 7*24*3600*1e9])],
+                neg.index[np.concatenate([np.diff(neg.index.astype(np.int64)) > 7*24*3600*1e9, [True]])],
+            ):
+                fig_stress.add_vrect(x0=seg_start, x1=seg_end,
+                    fillcolor="rgba(214,39,40,0.08)", line_width=0)
+    fig_stress.add_hline(y=400, line_dash="dot", line_color="#d62728", opacity=0.4,
+                          annotation_text="HY Stress >400bps", yref="y1")
+    fig_stress.update_layout(
+        title="📉 Market Stress: HY Spread (ซ้าย) + Yield Curve (ขวา)",
+        hovermode="x unified", height=350,
+        legend=dict(orientation="h", y=1.05),
+        xaxis=dict(rangeslider=dict(visible=True)),
+        yaxis=dict(title="HY OAS Spread (bps)", side="left"),
+        yaxis2=dict(title="10Y−2Y (%)", overlaying="y", side="right"),
+        annotations=[dict(
+            x=0.01, y=0.97, xref="paper", yref="paper",
+            text="พื้นที่แดง = Yield Curve Inversion (tightening cycle)",
+            showarrow=False, font=dict(size=10, color="gray"),
+        )],
+    )
+
+    # Fig 3: Global Dollar
+    fig_global = go.Figure()
+    dxy = wk.get("DXY_BROAD", pd.Series(dtype=float)).dropna()
+    if not dxy.empty:
+        dxy_rb = 100 * dxy / dxy.iloc[0]
+        fig_global.add_trace(go.Scatter(x=dxy_rb.index, y=dxy_rb.round(2).values,
+            mode="lines", name="DXY Broad (rebased 100)", yaxis="y1",
+            line=dict(color="#7f7f7f", width=1.8)))
+    if not china_m.dropna().empty:
+        fig_global.add_trace(go.Scatter(x=china_m.index, y=china_m.round(1).values,
+            mode="lines+markers", name="China FX Reserves (B USD)", yaxis="y2",
+            line=dict(color="#c5000b", width=1.8, dash="dash")))
+    fig_global.update_layout(
+        title="💵 Global Dollar Flow: DXY (ซ้าย) + China FX Reserves (ขวา)",
+        hovermode="x unified", height=350,
+        legend=dict(orientation="h", y=1.05),
+        yaxis=dict(title="DXY (rebased 100)", side="left"),
+        yaxis2=dict(title="China FX Reserves (B USD)", overlaying="y", side="right"),
+        annotations=[dict(
+            x=0.01, y=0.97, xref="paper", yref="paper",
+            text="⬆ DXY = dollar แข็ง = ดูด global liquidity  |  ⬇ China FX = PBOC ป้องหยวน = ดูด liquidity",
+            showarrow=False, font=dict(size=10, color="gray"),
+        )],
+    )
+
+    # Fig 4: Copper (Dr. Copper)
+    fig_copper = go.Figure()
+    cu = wk.get("COPPER", pd.Series(dtype=float)).dropna()
+    if not cu.empty:
+        cu_rb = 100 * cu / cu.iloc[0]
+        fig_copper.add_trace(go.Scatter(x=cu_rb.index, y=cu_rb.round(2).values,
+            mode="lines", name="Copper (rebased 100)",
+            line=dict(color="#b5541c", width=2.0)))
+    fig_copper.update_layout(
+        title="🔶 Dr. Copper — Leading Demand Indicator (3-6M ahead)",
+        hovermode="x unified", height=300,
+        yaxis_title="Index (Base=100)",
+        annotations=[dict(
+            x=0.01, y=0.97, xref="paper", yref="paper",
+            text="Copper มักนำ GDP และ GLI expansion ประมาณ 1 ไตรมาส",
+            showarrow=False, font=dict(size=10, color="gray"),
+        )],
+    )
+
+    # ── Summary Table ────────────────────────────────────────────
+    summary_rows = []
+    label_map = {
+        "RESERVES":   ("Reserve Balances",   "B USD",  "⬆ inject"),
+        "BTFP_PROXY": ("BTFP/Emergency Loans","M USD", "⬆ stealth QE"),
+        "MMF_ASSETS": ("Money Mkt Fund AUM",  "B USD",  "⬆ risk-off"),
+        "HY_SPREAD":  ("HY OAS Spread",       "bps",    "⬇ tight = ok"),
+        "YLD_CURVE":  ("10Y−2Y Curve",        "%",      "⬆ steepen = ok"),
+        "DXY_BROAD":  ("DXY Broad",           "index",  "⬇ = inject"),
+        "COPPER":     ("Copper",              "$/lb",   "⬆ = demand ok"),
+    }
+    for col, (name, unit, note) in label_map.items():
+        s = wk.get(col, pd.Series(dtype=float)).dropna()
+        if s.empty:
+            continue
+        latest = s.iloc[-1]
+        prev_y = s[s.index <= s.index[-1] - pd.DateOffset(years=1)]
+        yoy    = ((latest / prev_y.iloc[-1] - 1) * 100) if not prev_y.empty else np.nan
+        prev_m = s[s.index <= s.index[-1] - pd.DateOffset(months=1)]
+        mom    = ((latest / prev_m.iloc[-1] - 1) * 100) if not prev_m.empty else np.nan
+        summary_rows.append({
+            "Instrument":   name,
+            "Unit":         unit,
+            "Latest":       round(latest, 2),
+            "MoM %":        round(mom, 2) if pd.notna(mom) else np.nan,
+            "YoY %":        round(yoy, 2) if pd.notna(yoy) else np.nan,
+            "Signal Note":  note,
+            "As of":        s.index[-1].strftime("%d %b %Y"),
+        })
+    # China FX monthly
+    if not china_m.dropna().empty:
+        s = china_m.dropna()
+        latest = s.iloc[-1]
+        prev_y = s.iloc[-13] if len(s) >= 13 else np.nan
+        yoy    = ((latest / prev_y - 1) * 100) if pd.notna(prev_y) else np.nan
+        summary_rows.append({
+            "Instrument":   "China FX Reserves",
+            "Unit":         "B USD",
+            "Latest":       round(latest, 1),
+            "MoM %":        round((latest / s.iloc[-2] - 1) * 100, 2) if len(s) >= 2 else np.nan,
+            "YoY %":        round(yoy, 2) if pd.notna(yoy) else np.nan,
+            "Signal Note":  "⬇ = PBOC ดูด liquidity",
+            "As of":        s.index[-1].strftime("%b %Y"),
+        })
+
+    summary_tbl = pd.DataFrame(summary_rows)
+
+    return {
+        "df_weekly":    wk,
+        "df_monthly":   china_m.to_frame("CHINA_FX") if not china_m.empty else pd.DataFrame(),
+        "net_fed_liq":  net_fed,
+        "fig_inject":   fig_inject,
+        "fig_stress":   fig_stress,
+        "fig_global":   fig_global,
+        "fig_copper":   fig_copper,
+        "summary_tbl":  summary_tbl,
+    }
+
+# ================================================================
+# SECTION 4 : YEN CARRY TRADE & UNWIND ANALYSIS
+# ================================================================
+
+def yen_carry_analysis(wk: pd.DataFrame,
+                       fred_api_key: str = None,
+                       start: str = None) -> dict:
+    """
+    Yen Carry Trade + Unwind Detection
+
+    ═══ Logic ════════════════════════════════════════════════════
+    Carry Trade:
+      • กู้ JPY ดอกเบี้ย ~0% → แปลงเป็น USD → ลงทุนใน US risk assets
+      • USDJPY ขึ้น (JPY อ่อน) = carry expanding = risk-on
+      • USDJPY ลงเร็ว (JPY แข็ง) = UNWIND = ขาย risk assets บังคับ
+
+    GLI Connection (crucial):
+      BOJ_USD = BOJ_Assets_JPY ÷ USDJPY
+      • USDJPY ลง (JPY แข็ง) → BOJ_USD เพิ่มขึ้น → GLI ขึ้น  ← mechanical
+      • แต่ตลาดร่วงพร้อมกัน เพราะ carry unwind = forced selling
+      • Contradiction: GLI (formula) ขึ้น แต่ตลาดลง = สัญญาณ CARRY UNWIND
+
+    Unwind Severity Thresholds (% drop of USDJPY):
+      Minor  : > 3% in 4 weeks
+      Major  : > 7% in 8 weeks
+      Severe : > 12% in 12 weeks  (Aug 2024: 157→141 = −10.2%)
+
+    Parameters:
+      wk            : DataFrame จาก load_all()['wk'] (ต้องมี USDJPY, BOJ_USD, GLI_USD)
+      fred_api_key  : optional — ถ้าให้จะดึง JGB 10Y yield
+      start         : optional filter
+
+    Returns dict:
+      carry_df      : DataFrame weekly metrics
+      unwind_events : DataFrame of detected unwind events
+      fig_usdjpy    : USDJPY + unwind markers + carry state shading
+      fig_boj_impact: BOJ_USD vs GLI — แสดง mechanical effect
+      fig_vix       : VIX (ถ้าดึงได้) vs USDJPY
+      fig_matrix    : Scatter matrix carry state vs asset return (ถ้า monthly_rets ให้มา)
+      current_state : dict สรุปสถานะปัจจุบัน
+      jgb_10y       : Series JGB yield (หรือ None)
+    """
+    if "USDJPY" not in wk.columns:
+        raise ValueError("wk ต้องมีคอลัมน์ 'USDJPY' — ใช้ DataFrame จาก load_all()['wk']")
+
+    df = wk[["USDJPY"]].copy()
+    if "BOJ_USD" in wk.columns:
+        df["BOJ_USD"] = wk["BOJ_USD"]
+    if "GLI_USD" in wk.columns:
+        df["GLI_USD"] = wk["GLI_USD"]
+    if "BOJ_ASSETS" in wk.columns:
+        df["BOJ_JPY"] = wk["BOJ_ASSETS"]
+
+    if start:
+        df = df[df.index >= pd.to_datetime(start)]
+
+    usdjpy = df["USDJPY"].dropna()
+
+    # ── Carry Metrics ─────────────────────────────────────────
+    df["USDJPY_WoW_pct"]  = usdjpy.pct_change(1)  * 100   # weekly %
+    df["USDJPY_MoM_pct"]  = usdjpy.pct_change(4)  * 100   # 4-week %
+    df["USDJPY_3M_pct"]   = usdjpy.pct_change(13) * 100   # 13-week %
+    df["USDJPY_MA26"]     = usdjpy.rolling(26).mean()      # 6-month MA (trend)
+    df["USDJPY_MA52"]     = usdjpy.rolling(52).mean()      # 1-year MA
+
+    # Carry Regime:
+    #   EXPANDING  = USDJPY above MA26 and rising (JPY weakening = carry profitable)
+    #   CONTRACTING = USDJPY below MA26 or falling
+    df["CARRY_EXPANDING"] = (
+        (usdjpy > df["USDJPY_MA26"]) &
+        (df["USDJPY_MoM_pct"] > 0)
+    )
+
+    # ── BOJ Impact on GLI ─────────────────────────────────────
+    # If USDJPY drops X%, BOJ_USD rises by roughly X% (inverse relationship)
+    # This mechanically RAISES GLI even though carry is unwinding
+    if "BOJ_USD" in df.columns and "GLI_USD" in df.columns:
+        boj_share = (df["BOJ_USD"] / df["GLI_USD"]).rename("BOJ_GLI_share")
+        df["BOJ_GLI_share"] = boj_share
+        # Hypothetical GLI change from USDJPY move alone:
+        # dGLI_from_BOJ ≈ −(BOJ_share × USDJPY_WoW_pct)
+        df["GLI_mechanical_boost"] = -(df["BOJ_GLI_share"] * df["USDJPY_WoW_pct"])
+
+    # ── Unwind Event Detection ────────────────────────────────
+    THRESHOLDS = {
+        "Minor":  {"window": 4,  "pct_drop": -3.0},
+        "Major":  {"window": 8,  "pct_drop": -7.0},
+        "Severe": {"window": 13, "pct_drop": -12.0},
+    }
+    df["UNWIND_SEVERITY"] = "None"
+    for sev, cfg in THRESHOLDS.items():
+        chg = usdjpy.pct_change(cfg["window"]) * 100
+        mask = chg < cfg["pct_drop"]
+        df.loc[mask, "UNWIND_SEVERITY"] = sev
+
+    # Collect peak unwind events (contiguous → take most severe point)
+    unwind_rows = []
+    in_event, evt_start, evt_peak_date, evt_peak_val, evt_sev = False, None, None, 0.0, "None"
+    _sev_rank = {"None": 0, "Minor": 1, "Major": 2, "Severe": 3}
+    for dt, row in df.iterrows():
+        sev = row["UNWIND_SEVERITY"]
+        if sev != "None":
+            if not in_event:
+                in_event, evt_start = True, dt
+            chg_13w = df.loc[dt, "USDJPY_3M_pct"] if "USDJPY_3M_pct" in df.columns else np.nan
+            if _sev_rank.get(sev, 0) > _sev_rank.get(evt_sev, 0):
+                evt_sev = sev; evt_peak_date = dt; evt_peak_val = chg_13w
+        else:
+            if in_event:
+                unwind_rows.append({
+                    "Start": evt_start, "Peak": evt_peak_date,
+                    "Severity": evt_sev,
+                    "USDJPY_at_Peak": usdjpy.get(evt_peak_date, np.nan),
+                    "USDJPY_drop_%": round(evt_peak_val, 2) if pd.notna(evt_peak_val) else np.nan,
+                })
+                in_event = False; evt_sev = "None"
+
+    unwind_events = pd.DataFrame(unwind_rows) if unwind_rows else pd.DataFrame(
+        columns=["Start","Peak","Severity","USDJPY_at_Peak","USDJPY_drop_%"])
+
+    # ── Fetch VIX (Yahoo) ─────────────────────────────────────
+    vix = pd.Series(dtype=float)
+    try:
+        _start_str = str(start) if start else "2008-01-01"
+        vix = _yf_close("^VIX", start=_start_str, end=None)
+    except Exception:
+        pass
+    if not vix.dropna().empty:
+        vix_w = vix.resample("W-FRI").last().reindex(df.index).ffill()
+        df["VIX"] = vix_w
+
+    # ── Fetch JGB 10Y yield (FRED, optional) ─────────────────
+    jgb_10y = pd.Series(dtype=float)
+    if fred_api_key:
+        _key = sanitize_fred_key(fred_api_key)
+        if _key and validate_fred_key_format(_key) and Fred is not None:
+            try:
+                fred = Fred(api_key=_key)
+                jgb_raw = _fred_series(fred, "IRLTLT01JPM156N", start, None)
+                jgb_10y = jgb_raw.resample("W-FRI").last().reindex(df.index).ffill()
+                df["JGB_10Y"] = jgb_10y
+            except Exception:
+                pass
+
+    # ══════════════════════════════════════════════════════════
+    # FIGURES
+    # ══════════════════════════════════════════════════════════
+    _SEV_COLORS = {"Minor": "rgba(255,200,0,0.18)", "Major": "rgba(255,127,14,0.22)",
+                   "Severe": "rgba(214,39,40,0.28)"}
+
+    def _add_unwind_shading(fig):
+        for _, ev in unwind_events.iterrows():
+            color = _SEV_COLORS.get(ev["Severity"], "rgba(200,0,0,0.1)")
+            s = ev["Start"]; e = ev["Peak"]
+            if pd.notna(s) and pd.notna(e):
+                fig.add_vrect(x0=s, x1=e, fillcolor=color, line_width=0)
+                fig.add_annotation(x=s, y=0.98, yref="paper",
+                    text=f"⚠️{ev['Severity']}", showarrow=False,
+                    font=dict(size=9, color="#c00"), xanchor="left")
+        return fig
+
+    # ── Fig 1: USDJPY + Carry State ───────────────────────────
+    fig_usdjpy = go.Figure()
+
+    # Shade carry-expanding periods (green)
+    expanding = df["CARRY_EXPANDING"].fillna(False)
+    in_exp = False; exp_start = None
+    for dt, is_exp in expanding.items():
+        if is_exp and not in_exp:
+            in_exp = True; exp_start = dt
+        if (not is_exp or dt == expanding.index[-1]) and in_exp:
+            fig_usdjpy.add_vrect(x0=exp_start, x1=dt,
+                fillcolor="rgba(44,160,44,0.07)", line_width=0)
+            in_exp = False
+
+    fig_usdjpy.add_trace(go.Scatter(
+        x=usdjpy.index, y=usdjpy.values, mode="lines",
+        name="USD/JPY (JPY per USD)", line=dict(color="#1f77b4", width=2.0)))
+    if "USDJPY_MA26" in df.columns:
+        fig_usdjpy.add_trace(go.Scatter(
+            x=df.index, y=df["USDJPY_MA26"].values, mode="lines",
+            name="26W MA", line=dict(color="#ff7f0e", dash="dot", width=1.2)))
+    if "JGB_10Y" in df.columns and df["JGB_10Y"].dropna().size > 0:
+        fig_usdjpy.add_trace(go.Scatter(
+            x=df.index, y=df["JGB_10Y"].values, mode="lines",
+            name="JGB 10Y Yield (%)", yaxis="y2",
+            line=dict(color="#9467bd", dash="dash", width=1.2)))
+
+    _add_unwind_shading(fig_usdjpy)
+    fig_usdjpy.update_layout(
+        title="🇯🇵 USD/JPY + Carry Trade State<br>"
+              "<sup>🟢 = Carry Expanding (JPY weak)  |  🔴 shading = Unwind Event</sup>",
+        hovermode="x unified", height=400,
+        legend=dict(orientation="h", y=1.08),
+        xaxis=dict(rangeslider=dict(visible=True)),
+        yaxis=dict(title="JPY per USD", side="left"),
+        yaxis2=dict(title="JGB 10Y Yield (%)", overlaying="y", side="right"),
+    )
+
+    # ── Fig 2: BOJ Impact on GLI ──────────────────────────────
+    fig_boj = go.Figure()
+    if "GLI_USD" in df.columns:
+        gli_rb = 100 * df["GLI_USD"] / df["GLI_USD"].dropna().iloc[0]
+        fig_boj.add_trace(go.Scatter(
+            x=df.index, y=gli_rb.values, mode="lines",
+            name="GLI Index (rebased 100)", line=dict(color="#1f77b4", width=2)))
+    if "BOJ_USD" in df.columns:
+        boj_rb = 100 * df["BOJ_USD"] / df["BOJ_USD"].dropna().iloc[0]
+        fig_boj.add_trace(go.Scatter(
+            x=df.index, y=boj_rb.values, mode="lines",
+            name="BOJ_USD Component (rebased)", line=dict(color="#d62728", width=1.5, dash="dot")))
+
+    usdjpy_inv = 1 / usdjpy * (usdjpy.dropna().iloc[0])  # inverse scaled
+    fig_boj.add_trace(go.Scatter(
+        x=usdjpy_inv.index,
+        y=(100 * usdjpy_inv / usdjpy_inv.dropna().iloc[0]).values,
+        mode="lines", name="1/USDJPY (JPY strength, rebased)",
+        line=dict(color="#2ca02c", width=1.5, dash="dash")))
+
+    _add_unwind_shading(fig_boj)
+    fig_boj.update_layout(
+        title="🔗 GLI ↔ BOJ Component ↔ USDJPY Relationship<br>"
+              "<sup>JPY แข็ง → BOJ_USD ขึ้น → GLI ขึ้น (mechanical) — แต่ตลาดอาจลง!</sup>",
+        hovermode="x unified", height=370,
+        legend=dict(orientation="h", y=1.08),
+        yaxis_title="Index (Base=100)",
+        annotations=[dict(
+            x=0.01, y=0.97, xref="paper", yref="paper", showarrow=False,
+            text="⚠️ Contradiction: GLI (formula) ขึ้นจาก JPY แข็ง ≠ Liquidity จริงเพิ่ม",
+            font=dict(size=10, color="darkred"))],
+    )
+
+    # ── Fig 3: VIX vs USDJPY ─────────────────────────────────
+    fig_vix = go.Figure()
+    if "VIX" in df.columns and df["VIX"].dropna().size > 0:
+        fig_vix.add_trace(go.Scatter(
+            x=df.index, y=df["VIX"].values, mode="lines",
+            name="VIX (Fear Index)", yaxis="y1",
+            line=dict(color="#d62728", width=1.5)))
+        fig_vix.add_hline(y=20, line_dash="dot", line_color="orange", yref="y1",
+                           annotation_text="VIX 20 = เริ่มผันผวน")
+        fig_vix.add_hline(y=30, line_dash="dot", line_color="red", yref="y1",
+                           annotation_text="VIX 30 = Panic zone")
+    fig_vix.add_trace(go.Scatter(
+        x=usdjpy.index, y=usdjpy.values, mode="lines",
+        name="USD/JPY", yaxis="y2",
+        line=dict(color="#1f77b4", width=1.5, dash="dot")))
+    _add_unwind_shading(fig_vix)
+    fig_vix.update_layout(
+        title="😱 VIX vs USD/JPY — Carry Unwind = VIX พุ่ง + JPY แข็ง พร้อมกัน",
+        hovermode="x unified", height=350,
+        legend=dict(orientation="h", y=1.08),
+        yaxis=dict(title="VIX", side="left"),
+        yaxis2=dict(title="JPY per USD", overlaying="y", side="right"),
+    )
+
+    # ── Fig 4: USDJPY MoM% ───────────────────────────────────
+    mom = df["USDJPY_MoM_pct"].dropna()
+    colors_mom = np.where(mom.values >= 0, "#2ca02c", "#d62728")
+    fig_mom = go.Figure()
+    fig_mom.add_trace(go.Bar(x=mom.index, y=mom.values,
+        name="USDJPY MoM %", marker_color=colors_mom))
+    fig_mom.add_hline(y=-3,  line_dash="dot", line_color="orange",
+                       annotation_text="Minor Unwind threshold (−3%)")
+    fig_mom.add_hline(y=-7,  line_dash="dot", line_color="red",
+                       annotation_text="Major Unwind threshold (−7%)")
+    fig_mom.update_layout(
+        title="📉 USDJPY 4-Week Change % — Carry Unwind Detection",
+        hovermode="x unified", height=300,
+        yaxis_title="USDJPY MoM % (4W)",
+        annotations=[dict(x=0.01, y=0.97, xref="paper", yref="paper",
+            text="ลงผ่าน −3% = Minor | −7% = Major Unwind",
+            showarrow=False, font=dict(size=10, color="darkred"))],
+    )
+
+    # ── Current State Summary ─────────────────────────────────
+    now_usdjpy   = usdjpy.iloc[-1]
+    now_mom      = df["USDJPY_MoM_pct"].dropna().iloc[-1]
+    now_3m       = df["USDJPY_3M_pct"].dropna().iloc[-1] if df["USDJPY_3M_pct"].dropna().size else np.nan
+    now_carry    = "🟢 Expanding" if df["CARRY_EXPANDING"].iloc[-1] else "🔴 Contracting/Unwind Risk"
+    now_sev      = df["USDJPY_SEVERITY"] if "USDJPY_SEVERITY" in df.columns else df["UNWIND_SEVERITY"].iloc[-1]
+
+    if pd.notna(now_mom):
+        if now_mom < -7:     unwind_status = "🚨 MAJOR UNWIND in progress"
+        elif now_mom < -3:   unwind_status = "⚠️ Minor Unwind signal"
+        elif now_mom > 3:    unwind_status = "✅ Carry Expanding (JPY weakening)"
+        else:                unwind_status = "🟡 Neutral / Consolidating"
+    else:
+        unwind_status = "—"
+
+    if "BOJ_GLI_share" in df.columns:
+        boj_share_now = df["BOJ_GLI_share"].dropna().iloc[-1] * 100
+    else:
+        boj_share_now = np.nan
+
+    current_state = {
+        "USDJPY":           round(now_usdjpy, 2),
+        "MoM_%":            round(float(now_mom), 2) if pd.notna(now_mom) else np.nan,
+        "3M_%":             round(float(now_3m), 2)  if pd.notna(now_3m) else np.nan,
+        "Carry_State":      now_carry,
+        "Unwind_Status":    unwind_status,
+        "BOJ_GLI_share_%":  round(float(boj_share_now), 1) if pd.notna(boj_share_now) else np.nan,
+        "VIX_latest":       round(float(df["VIX"].dropna().iloc[-1]), 1)
+                            if "VIX" in df.columns and df["VIX"].dropna().size > 0 else np.nan,
+        "JGB_10Y_latest":   round(float(df["JGB_10Y"].dropna().iloc[-1]), 3)
+                            if "JGB_10Y" in df.columns and df["JGB_10Y"].dropna().size > 0 else np.nan,
+    }
+
+    return {
+        "carry_df":       df,
+        "unwind_events":  unwind_events,
+        "fig_usdjpy":     fig_usdjpy,
+        "fig_boj_impact": fig_boj,
+        "fig_vix":        fig_vix,
+        "fig_mom":        fig_mom,
+        "current_state":  current_state,
+        "jgb_10y":        jgb_10y,
+    }
