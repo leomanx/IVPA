@@ -105,6 +105,8 @@ def _fred_series(fred, sid, start=None, end=None, force_daily=False):
         s = fred.get_series(sid)
     except Exception as e:
         msg = str(e).lower()
+        if "does not exist" in msg:
+            raise RuntimeError(f"ดึง FRED series '{sid}' ไม่สำเร็จ: {e}") from e
         if any(k in msg for k in ("api key", "api_key", "400", "bad request", "unauthorized")):
             raise FredKeyError(
                 f"FRED ปฏิเสธคำขอ (series={sid}): {e}\n"
