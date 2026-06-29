@@ -230,7 +230,7 @@ def load_all(
         "ECB_ASSETS": to_weekly(raw["ECB_ASSETS"]),
         "BOJ_ASSETS": to_weekly(raw["BOJ_ASSETS"]),
         "TGA":        to_weekly(raw["TGA"]),
-        "ONRRP":      to_weekly(raw["ONRRP"]),
+        "ONRRP":      to_weekly(raw["ONRRP"]) * 1000, # Convert Billions to Millions to match WALCL
         "USDJPY":     to_weekly(raw["USDJPY"]),
         "USDEUR":     to_weekly(raw["USDEUR"]),
     }).dropna(how="any")
@@ -362,9 +362,8 @@ def load_all(
                               text=annual_rets_plot[c].round(1).astype(str) + '%', textposition='auto'))
     fig2.update_layout(title="Annual YoY: GLI (line) vs Assets (bars)",
                        barmode="group", hovermode="x unified",
-                       legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-                       margin=dict(t=60, b=80),
-                       xaxis=dict(rangeslider=dict(visible=True)))
+                       legend=dict(orientation="h", y=-0.20, x=0.5, xanchor="center"),
+                       margin=dict(t=60, b=100))
 
     return {
         "wk": wk,
@@ -447,7 +446,6 @@ def gli_yoy_vs_gold(monthly, monthly_rets, regime_df, exp_periods):
     fig.update_layout(title="GLI YoY (ซ้าย) vs GOLD %/เดือน (ขวา) + Expansion",
                       hovermode="x unified",
                       legend=dict(orientation="h", y=1.05),
-                      xaxis=dict(rangeslider=dict(visible=True)),
                       yaxis=dict(title="GLI %YoY"),
                       yaxis2=dict(title="GOLD %/mo", overlaying="y", side="right"))
     return fig
@@ -1023,6 +1021,10 @@ FED_PLUMBING_SERIES = {
     "CHINA_FX":   "RRFXRBCNM",       # China FX Reserves (monthly, billions USD)
                                      # ลด = PBOC ขาย USD ป้องหยวน = ดูด global liquidity
                                      # เพิ่ม = inject liquidity เข้าระบบ
+    # ── Core Liquidity ──
+    "WALCL":      "WALCL",           # Fed Total Assets (weekly)
+    "TGA":        "WTREGEN",         # Treasury General Account (weekly)
+    "ONRRP":      "RRPONTSYD",       # Overnight Reverse Repo (daily)
 }
 
 # Copper via Yahoo (no FRED series for spot copper)
@@ -1089,8 +1091,18 @@ def fed_plumbing(fred_api_key: str,
         "HY_SPREAD":  _to_w(raw.get("HY_SPREAD",  pd.Series(dtype=float))),
         "YLD_CURVE":  _to_w(raw.get("YLD_CURVE",  pd.Series(dtype=float))),
         "DXY_BROAD":  _to_w(raw.get("DXY_BROAD",  pd.Series(dtype=float))),
+        "WALCL":      _to_w(raw.get("WALCL",      pd.Series(dtype=float))),
+        "TGA":        _to_w(raw.get("TGA",        pd.Series(dtype=float))),
+        "ONRRP":      _to_w(raw.get("ONRRP",      pd.Series(dtype=float))),
         "COPPER":     _to_w(raw.get("COPPER",      pd.Series(dtype=float))),
     })
+
+    # Pull S&P 500 from Yahoo for Net Liquidity comparison
+    try:
+        sp500_m = _yf_close("^GSPC", start=start, end=end)
+        wk["SP500"] = _to_w(sp500_m)
+    except:
+        pass
 
     # CHINA_FX stays monthly
     china_fx = raw.get("CHINA_FX", pd.Series(dtype=float))
@@ -1100,42 +1112,49 @@ def fed_plumbing(fred_api_key: str,
         china_m = pd.Series(dtype=float)
 
     # ── Net Fed Liquidity ─────────────────────────────────────────
-    # Reserves (B) + BTFP_PROXY (M→B) = net banking system liquidity
-    # MMF represents WHERE idle cash hides (high = risk-off = not injected into market)
+    # Classic Macro Net Liquidity = Fed Assets - TGA - RRP
     net_fed = pd.Series(dtype=float)
-    if "RESERVES" in wk.columns and wk["RESERVES"].dropna().size > 0:
-        r = wk["RESERVES"].dropna()
-        b = (wk["BTFP_PROXY"] / 1000).reindex(r.index).fillna(0)  # millions → billions
-        net_fed = (r + b).rename("Net_Fed_Liq_B")
+    has_net = all(c in wk.columns for c in ["WALCL", "TGA", "ONRRP"])
+    if has_net:
+        w_b = wk["WALCL"].dropna() / 1000.0  # Millions to Billions
+        t_b = (wk["TGA"].reindex(w_b.index).ffill()) / 1000.0  # Millions to Billions
+        r_b = wk["ONRRP"].reindex(w_b.index).ffill()  # Already in Billions
+        net_fed = (w_b - t_b - r_b).dropna().rename("Net_Fed_Liq_B")
 
     # ── Figures ──────────────────────────────────────────────────
 
     # Fig 1: Stealth Injections (stacked area)
     fig_inject = go.Figure()
     _inject_series = [
-        ("RESERVES",   "#1f77b4", "Reserve Balances (B USD)"),
-        ("BTFP_PROXY", "#d62728", "Emergency Loans / BTFP (M USD → scaled)"),
-        ("MMF_ASSETS", "#ff7f0e", "MMF Assets (B USD) — risk-off parking"),
+        ("RESERVES",   "#1f77b4", "Reserve Balances (B USD)", True),
+        ("BTFP_PROXY", "#d62728", "Emergency Loans / BTFP (B USD)", True),
+        ("MMF_ASSETS", "#ff7f0e", "MMF Assets (B USD) — risk-off parking", False),
+        ("TGA",        "#9467bd", "Treasury General Account (B USD)", False),
+        ("ONRRP",      "#8c564b", "Overnight Reverse Repo (B USD)", False),
     ]
-    for col, color, label in _inject_series:
+    for col, color, label, fill_area in _inject_series:
         s = wk.get(col, pd.Series(dtype=float)).dropna()
         if s.empty:
             continue
-        # BTFP is in millions; scale to billions for chart
-        vals = s / 1000 if col == "BTFP_PROXY" else s
+        
+        # Convert Millions to Billions for specific series
+        if col in ["RESERVES", "BTFP_PROXY", "TGA"]:
+            vals = s / 1000.0
+        else:
+            vals = s
+            
         fig_inject.add_trace(go.Scatter(
             x=vals.index, y=vals.round(1).values,
             mode="lines", name=label, line=dict(color=color, width=1.8),
-            fill=("tonexty" if col != "RESERVES" else "tozeroy"),
+            fill=("tozeroy" if fill_area else None),
             fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.12)"
-                       if color.startswith("#") else "rgba(0,0,0,0.08)",
+                       if color.startswith("#") and fill_area else None,
         ))
     fig_inject.update_layout(
         title="🏦 Fed Plumbing: Stealth Liquidity (Reserves + BTFP + MMF)",
         hovermode="x unified", height=420,
-        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-        margin=dict(t=80, b=80),
-        xaxis=dict(rangeslider=dict(visible=True)),
+        legend=dict(orientation="h", y=-0.20, x=0.5, xanchor="center"),
+        margin=dict(t=80, b=100),
         yaxis_title="Billions USD",
         annotations=[dict(
             x=0.5, y=1.02, xref="paper", yref="paper", xanchor="center", yanchor="bottom",
@@ -1143,6 +1162,31 @@ def fed_plumbing(fred_api_key: str,
             showarrow=False, font=dict(size=10, color="gray"),
         )],
     )
+
+    # ── Net Liquidity vs S&P 500 ──
+    fig_net_liq_sp500 = go.Figure()
+    if not net_fed.empty:
+        fig_net_liq_sp500.add_trace(go.Scatter(
+            x=net_fed.index, y=net_fed.round(2).values,
+            mode="lines", name="Net Fed Liquidity (B USD)", yaxis="y1",
+            line=dict(color="#1f77b4", width=2)
+        ))
+    if "SP500" in wk.columns and not wk["SP500"].dropna().empty:
+        sp = wk["SP500"].dropna()
+        fig_net_liq_sp500.add_trace(go.Scatter(
+            x=sp.index, y=sp.round(2).values,
+            mode="lines", name="S&P 500", yaxis="y2",
+            line=dict(color="#2ca02c", width=2)
+        ))
+    fig_net_liq_sp500.update_layout(
+        title="📈 Net Fed Liquidity vs S&P 500",
+        hovermode="x unified", height=420,
+        legend=dict(orientation="h", y=-0.20, x=0.5, xanchor="center"),
+        margin=dict(t=80, b=100),
+        yaxis=dict(title="Net Liquidity (Billions USD)", side="left"),
+        yaxis2=dict(title="S&P 500", overlaying="y", side="right"),
+    )
+
 
     # Fig 2: Market Stress
     fig_stress = go.Figure()
@@ -1170,9 +1214,8 @@ def fed_plumbing(fred_api_key: str,
     fig_stress.update_layout(
         title="📉 Market Stress: HY Spread (ซ้าย) + Yield Curve (ขวา)",
         hovermode="x unified", height=380,
-        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-        margin=dict(t=80, b=80),
-        xaxis=dict(rangeslider=dict(visible=True)),
+        legend=dict(orientation="h", y=-0.20, x=0.5, xanchor="center"),
+        margin=dict(t=80, b=100),
         yaxis=dict(title="HY OAS Spread (bps)", side="left"),
         yaxis2=dict(title="10Y−2Y (%)", overlaying="y", side="right"),
         annotations=[dict(
@@ -1194,18 +1237,30 @@ def fed_plumbing(fred_api_key: str,
         fig_global.add_trace(go.Scatter(x=china_m.index, y=china_m.round(1).values,
             mode="lines+markers", name="China FX Reserves (B USD)", yaxis="y2",
             line=dict(color="#c5000b", width=1.8, dash="dash")))
-    fig_global.update_layout(
-        title="💵 Global Dollar Flow: DXY (ซ้าย) + China FX Reserves (ขวา)",
-        hovermode="x unified", height=350,
-        legend=dict(orientation="h", y=1.05),
-        yaxis=dict(title="DXY (rebased 100)", side="left"),
-        yaxis2=dict(title="China FX Reserves (B USD)", overlaying="y", side="right"),
-        annotations=[dict(
-            x=0.01, y=0.97, xref="paper", yref="paper",
-            text="⬆ DXY = dollar แข็ง = ดูด global liquidity  |  ⬇ China FX = PBOC ป้องหยวน = ดูด liquidity",
-            showarrow=False, font=dict(size=10, color="gray"),
-        )],
-    )
+        fig_global.update_layout(
+            title="💵 Global Dollar Flow: DXY (ซ้าย) + China FX Reserves (ขวา)",
+            hovermode="x unified", height=350,
+            legend=dict(orientation="h", y=1.05),
+            yaxis=dict(title="DXY (rebased 100)", side="left"),
+            yaxis2=dict(title="China FX Reserves (B USD)", overlaying="y", side="right"),
+            annotations=[dict(
+                x=0.01, y=0.97, xref="paper", yref="paper",
+                text="⬆ DXY = dollar แข็ง = ดูด global liquidity  |  ⬇ China FX = PBOC ป้องหยวน = ดูด liquidity",
+                showarrow=False, font=dict(size=10, color="gray"),
+            )],
+        )
+    else:
+        fig_global.update_layout(
+            title="💵 Global Dollar Flow: DXY (Broad USD Index)",
+            hovermode="x unified", height=350,
+            legend=dict(orientation="h", y=1.05),
+            yaxis=dict(title="DXY (rebased 100)", side="left"),
+            annotations=[dict(
+                x=0.01, y=0.97, xref="paper", yref="paper",
+                text="⬆ DXY = dollar แข็ง = ดูด global liquidity (สภาพคล่องลดลง)",
+                showarrow=False, font=dict(size=10, color="gray"),
+            )],
+        )
 
     # Fig 4: Copper (Dr. Copper)
     fig_copper = go.Figure()
@@ -1230,9 +1285,9 @@ def fed_plumbing(fred_api_key: str,
     summary_rows = []
     label_map = {
         "RESERVES":   ("Reserve Balances",   "B USD",  "⬆ inject"),
-        "BTFP_PROXY": ("BTFP/Emergency Loans","M USD", "⬆ stealth QE"),
+        "BTFP_PROXY": ("BTFP/Emergency Loans","B USD", "⬆ stealth QE"),
         "MMF_ASSETS": ("Money Mkt Fund AUM",  "B USD",  "⬆ risk-off"),
-        "HY_SPREAD":  ("HY OAS Spread",       "bps",    "⬇ tight = ok"),
+        "HY_SPREAD":  ("HY OAS Spread",       "%",      "⬇ tight = ok"),
         "YLD_CURVE":  ("10Y−2Y Curve",        "%",      "⬆ steepen = ok"),
         "DXY_BROAD":  ("DXY Broad",           "index",  "⬇ = inject"),
         "COPPER":     ("Copper",              "$/lb",   "⬆ = demand ok"),
@@ -1242,10 +1297,15 @@ def fed_plumbing(fred_api_key: str,
         if s.empty:
             continue
         latest = s.iloc[-1]
+        
+        # Scale down if it's in Millions to Billions
+        if col in ["RESERVES", "BTFP_PROXY"]:
+            latest = latest / 1000.0
+            
         prev_y = s[s.index <= s.index[-1] - pd.DateOffset(years=1)]
-        yoy    = ((latest / prev_y.iloc[-1] - 1) * 100) if not prev_y.empty else np.nan
+        yoy    = ((s.iloc[-1] / prev_y.iloc[-1] - 1) * 100) if not prev_y.empty else np.nan
         prev_m = s[s.index <= s.index[-1] - pd.DateOffset(months=1)]
-        mom    = ((latest / prev_m.iloc[-1] - 1) * 100) if not prev_m.empty else np.nan
+        mom    = ((s.iloc[-1] / prev_m.iloc[-1] - 1) * 100) if not prev_m.empty else np.nan
         summary_rows.append({
             "Instrument":   name,
             "Unit":         unit,
@@ -1278,6 +1338,7 @@ def fed_plumbing(fred_api_key: str,
         "df_monthly":   china_m.to_frame("CHINA_FX") if not china_m.empty else pd.DataFrame(),
         "net_fed_liq":  net_fed,
         "fig_inject":   fig_inject,
+        "fig_net_liq_sp500": fig_net_liq_sp500,
         "fig_stress":   fig_stress,
         "fig_global":   fig_global,
         "fig_copper":   fig_copper,
@@ -1473,13 +1534,15 @@ def yen_carry_analysis(wk: pd.DataFrame,
             line=dict(color="#9467bd", dash="dash", width=1.2)))
 
     _add_unwind_shading(fig_usdjpy)
+    x_max = usdjpy.index[-1] + pd.DateOffset(weeks=6) if not usdjpy.empty else None
+    
     fig_usdjpy.update_layout(
         title="🇯🇵 USD/JPY + Carry Trade State<br>"
               "<sup>🟢 = Carry Expanding (JPY weak)  |  🔴 shading = Unwind Event</sup>",
         hovermode="x unified", height=450,
-        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-        margin=dict(t=90, b=80),
-        xaxis=dict(rangeslider=dict(visible=True)),
+        legend=dict(orientation="h", y=-0.20, x=0.5, xanchor="center"),
+        margin=dict(t=90, b=100),
+        xaxis=dict(range=[usdjpy.index[0], x_max] if x_max else None),
         yaxis=dict(title="JPY per USD", side="left"),
         yaxis2=dict(title="JGB 10Y Yield (%)", overlaying="y", side="right"),
     )

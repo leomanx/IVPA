@@ -858,26 +858,12 @@ if show_plumb:
             st.plotly_chart(P["fig_copper"], use_container_width=True)
 
         # ── Net Fed Liquidity ─────────────────────────────────
-        net = P.get("net_fed_liq", pd.Series(dtype=float))
-        if not net.dropna().empty:
-            st.subheader("🧮 Net Fed Liquidity = Reserves + BTFP")
-            fig_net = go.Figure()
-            fig_net.add_trace(go.Scatter(
-                x=net.index, y=net.round(1).values,
-                mode="lines", name="Net Fed Liq (B USD)",
-                fill="tozeroy", fillcolor="rgba(31,119,180,0.13)",
-                line=dict(color="#1f77b4", width=2),
-            ))
-            fig_net.update_layout(
-                height=280, hovermode="x unified",
-                yaxis_title="Billions USD",
-                xaxis=dict(rangeslider=dict(visible=True)),
-            )
-            st.plotly_chart(fig_net, use_container_width=True)
+        if "fig_net_liq_sp500" in P and P["fig_net_liq_sp500"] is not None:
+            st.plotly_chart(P["fig_net_liq_sp500"], use_container_width=True)
             st.caption(
-                "Net Fed Liq = Reserve Balances + Emergency Loans(BTFP)  "
-                "↑ สูง = ธนาคารมีสภาพคล่องมาก → risk-on  "
-                "↓ ต่ำ = ธนาคารระวังตัว → ระวัง stress event"
+                "Net Fed Liq = WALCL (Fed Assets) - TGA (Treasury) - RRP (Reverse Repo)  \n"
+                "↑ สูง = ธนาคารมีสภาพคล่องมาก → มักจะดัน S&P 500 ขึ้น  \n"
+                "↓ ต่ำ = ธนาคารระวังตัว → ตลาดมักจะผันผวนหรือปรับฐาน"
             )
 
         # ── Interpretation Guide ─────────────────────────────
