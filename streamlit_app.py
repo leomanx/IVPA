@@ -19,16 +19,26 @@ with cols[1]:
     st.page_link("pages/02_GLI_Dashboard.py", label="🌊 GLI Dashboard")
 
 # ----- Environment / Secrets check -----
-fred_key = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", "")).strip()
+import gli_lib as gl
+
+_raw_key = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", ""))
+fred_key = gl.sanitize_fred_key(_raw_key)
+
 st.subheader("Environment")
-if fred_key:
-    st.success("FRED_API_KEY: detected ✅ (พร้อมใช้งาน GLI)")
-else:
+if not fred_key:
     st.warning(
         "ยังไม่พบ **FRED_API_KEY**\n\n"
         "- รันท้องถิ่น: สร้าง `.streamlit/secrets.toml` แล้วใส่ `FRED_API_KEY = \"...\"`\n"
         "- Streamlit Cloud: ไปที่ App → Settings → **Secrets** แล้วใส่ค่าเดียวกัน"
     )
+elif not gl.validate_fred_key_format(fred_key):
+    st.error(
+        f"พบ **FRED_API_KEY** แต่รูปแบบไม่ถูกต้อง ({gl.mask_key(fred_key)})\n\n"
+        "ต้องเป็นตัวอักษร/ตัวเลข **32 ตัว** (ไม่มีช่องว่าง/อักขระพิเศษ/quote)\n"
+        "ขอคีย์ใหม่ได้ที่ https://fred.stlouisfed.org/docs/api/api_key.html"
+    )
+else:
+    st.success(f"FRED_API_KEY: detected ✅ ({gl.mask_key(fred_key)}) — พร้อมใช้งาน GLI")
 
 # ----- Tips -----
 with st.expander("How to"):
