@@ -810,7 +810,7 @@ if show_plumb:
     """)
 
     # Fetch (cached separately, start from 2020 เพื่อเห็น COVID + BTFP cycle)
-    plumb_start = st.selectbox("Plumbing Start Year", ["2015","2018","2020","2022"],
+    plumb_start = st.selectbox("Plumbing Start Year", ["2015","2018","2020","2022","2024","2025","2026"],
                                index=2, key="plumb_start")
 
     @st.cache_data(ttl=3_600, show_spinner="🔬 ดึง Fed Plumbing data…")

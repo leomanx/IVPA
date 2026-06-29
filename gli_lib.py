@@ -1156,8 +1156,8 @@ def fed_plumbing(fred_api_key: str,
         neg = yc[yc < 0]
         if not neg.empty:
             for seg_start, seg_end in zip(
-                neg.index[np.concatenate([[True], np.diff(neg.index.astype(np.int64)) > 7*24*3600*1e9])],
-                neg.index[np.concatenate([np.diff(neg.index.astype(np.int64)) > 7*24*3600*1e9, [True]])],
+                neg.index[np.concatenate([[True], np.diff(neg.index) > np.timedelta64(7, 'D')])],
+                neg.index[np.concatenate([np.diff(neg.index) > np.timedelta64(7, 'D'), [True]])],
             ):
                 fig_stress.add_vrect(x0=seg_start, x1=seg_end,
                     fillcolor="rgba(214,39,40,0.08)", line_width=0)
