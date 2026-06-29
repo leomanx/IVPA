@@ -927,7 +927,8 @@ if show_yen:
 
     @st.cache_data(ttl=3_600, show_spinner="🇯🇵 วิเคราะห์ Yen Carry Trade…")
     def _yen(wk_json, key, s):
-        _wk = pd.read_json(wk_json)
+        import io
+        _wk = pd.read_json(io.StringIO(wk_json))
         _wk.index = pd.to_datetime(_wk.index)
         return gl.yen_carry_analysis(_wk, fred_api_key=key, start=s)
 
