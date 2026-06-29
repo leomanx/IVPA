@@ -9,3 +9,4 @@ kaleido>=0.2
 scipy>=1.11
 fredapi>=0.5
 statsmodels>=0.14
+matplotlib>=3.7
