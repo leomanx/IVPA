@@ -122,8 +122,28 @@ def _fred_series(fred, sid, start=None, end=None, force_daily=False):
 
 def _yf_close(ticker, start=None, end=None):
     df = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
-    if df is None or df.empty or "Close" not in df: return pd.Series(dtype=float)
-    s = df["Close"].copy(); s.index = pd.to_datetime(s.index); return s.sort_index()
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    # yfinance ≥0.2.x อาจคืน MultiIndex columns: ("Close", "BTC-USD") ฯลฯ
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = df.columns.get_level_values(0)
+        if "Close" not in lvl0:
+            return pd.Series(dtype=float)
+        s = df["Close"]
+        # df["Close"] บน MultiIndex คืน DataFrame ที่มีคอลัมน์เป็น ticker
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]   # เอาคอลัมน์แรก (single ticker)
+    else:
+        if "Close" not in df.columns:
+            return pd.Series(dtype=float)
+        s = df["Close"]
+
+    s = s.copy().squeeze()     # บังคับเป็น Series ถ้ายังเป็น DataFrame 1 col
+    if not isinstance(s, pd.Series):
+        return pd.Series(dtype=float)
+    s.index = pd.to_datetime(s.index)
+    return s.dropna().sort_index()
 
 # ---------- PUBLIC APIS ----------
 def load_all(
@@ -248,6 +268,9 @@ def load_all(
         assets[name] = s
 
     assets_df = pd.concat({k:v for k,v in assets.items() if v.dropna().size}, axis=1)
+    # บังคับชื่อคอลัมน์เป็น string เสมอ (ป้องกัน tuple จาก yfinance MultiIndex)
+    assets_df.columns = [str(c) if not isinstance(c, str) else c
+                         for c in assets_df.columns]
     assets_df = assets_df.asfreq("D").ffill()
 
     # Monthly & Annual
@@ -581,7 +604,7 @@ def lead_lag_analysis(monthly_rets: pd.DataFrame, max_lag: int = 12) -> dict:
     for i, a in enumerate(assets):
         fig.add_trace(go.Scatter(
             x=lags, y=ccf_df[a].round(3).values,
-            mode="lines+markers", name=a,
+            mode="lines+markers", name=str(a),
             line=dict(color=colors[i % len(colors)]),
             hovertemplate=f"<b>{a}</b><br>Lag=%{{x}} mo<br>r=%{{y:.3f}}<extra></extra>",
         ))
