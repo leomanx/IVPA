@@ -252,11 +252,11 @@ def load_all(
 
     # Monthly & Annual
     gli_m    = wk["GLI_INDEX"].resample("ME").last().rename("GLI_INDEX")
-    assets_m = assets_df.resample("M").last()
+    assets_m = assets_df.resample("ME").last()
     monthly  = pd.concat([gli_m, assets_m], axis=1).dropna(how="any")
     monthly_rets = monthly.pct_change().dropna() * 100.0
 
-    assets_yr = assets_df.resample("A-DEC").last()
+    assets_yr = assets_df.resample("YE-DEC").last()
     gli_yr    = wk["GLI_INDEX"].resample("YE-DEC").last().to_frame("GLI_INDEX")
     
     # บังคับให้เป็น DatetimeIndex แบบ normalized
